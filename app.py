@@ -300,7 +300,7 @@ LANG = {
         "nav_help": "Help Center",
         "total_items": "Total Items",
         "total_qty": "Total Stock Qty",
-        "low_stock": "Min Stock Alert ️",
+        "low_stock": "Min Stock Alert ⚠️",
         "current_stock_title": "Current Inventory Status",
         "no_items": "No items recorded yet.",
         "lang_btn": "English 🇺🇸",
@@ -400,33 +400,79 @@ t = LANG[st.session_state.lang]
 is_ar = st.session_state.lang == 'ar'
 direction = "rtl" if is_ar else "ltr"
 
-# Modern UI Styling - LIGHT BACKGROUND THEME
+# FORCE LIGHT THEME - Strong CSS Override
+st.markdown("""
+<style>
+    /* FORCE LIGHT MODE ON EVERYTHING */
+    .stApp, .stApp > header, .stApp > div, .stApp > div > div {
+        background-color: #f8fafc !important;
+    }
+    
+    /* Sidebar Light Background */
+    section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
+        background-color: #ffffff !important;
+    }
+    
+    /* Main Content Area */
+    .main .block-container {
+        background-color: #f8fafc !important;
+    }
+    
+    /* All containers */
+    div[data-testid="stVerticalBlock"], div[data-testid="stHorizontalBlock"] {
+        background-color: transparent !important;
+    }
+    
+    /* Streamlit buttons light */
+    .stButton > button {
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+        border: 1px solid #e2e8f0 !important;
+    }
+    
+    .stButton > button:hover {
+        background-color: #f1f5f9 !important;
+    }
+    
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%) !important;
+        color: white !important;
+        border: none !important;
+    }
+    
+    /* Text inputs light */
+    .stTextInput > div > div > input {
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+        border: 1px solid #e2e8f0 !important;
+    }
+    
+    /* Select boxes light */
+    .stSelectbox > div > div > div {
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+    }
+    
+    /* Number inputs light */
+    .stNumberInput > div > div > input {
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+    }
+    
+    /* Hide default Streamlit elements */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+
+# Modern UI Styling
 st.markdown(f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
     
     * {{
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    }}
-    
-    /* Main Background - LIGHT THEME */
-    .main {{
-        background-color: #f8fafc;
-    }}
-    
-    .main > div {{
-        background-color: #f8fafc;
-        padding-top: 2rem;
-    }}
-    
-    /* Sidebar Styling */
-    [data-testid="stSidebar"] {{
-        background-color: #ffffff;
-        border-right: 1px solid #e2e8f0;
-    }}
-    
-    [data-testid="stSidebar"] .css-1d391kg {{
-        background-color: #ffffff;
     }}
     
     /* Header Section */
@@ -744,11 +790,6 @@ st.markdown(f"""
         margin-bottom: 24px;
     }}
     
-    /* Hide Streamlit elements */
-    #MainMenu {{visibility: hidden;}}
-    footer {{visibility: hidden;}}
-    header {{visibility: hidden;}}
-    
     /* Custom Scrollbar */
     ::-webkit-scrollbar {{
         width: 8px;
@@ -769,15 +810,12 @@ st.markdown(f"""
         background: #94a3b8;
     }}
     
-    /* Code Block Styling - Light Theme */
-    code, pre {{
-        background-color: #f1f5f9 !important;
-        color: #334155 !important;
-    }}
-    
-    /* Streamlit Containers */
-    .stMarkdown, .stDataFrame {{
-        background-color: transparent;
+    /* Checkbox styling */
+    input[type="checkbox"] {{
+        width: 16px;
+        height: 16px;
+        cursor: pointer;
+        accent-color: #7c3aed;
     }}
     </style>
 """, unsafe_allow_html=True)
@@ -806,10 +844,10 @@ with st.sidebar:
     st.markdown("**Navigation**")
     
     menu_items = [
-        ("", t["nav_dash"]),
-        ("", t["nav_items"]),
-        ("", t["nav_notifications"]),
-        ("", t["nav_shipments"]),
+        ("📊", t["nav_dash"]),
+        ("📦", t["nav_items"]),
+        ("🔔", t["nav_notifications"]),
+        ("🚚", t["nav_shipments"]),
         ("📥", t["nav_receiving"]),
         ("📍", t["nav_zones"]),
         ("🤝", t["nav_suppliers"]),
@@ -1033,16 +1071,4 @@ st.markdown(f"""
         </div>
     </div>
 </div>
-""", unsafe_allow_html=True)
-
-# Add custom CSS for checkbox styling
-st.markdown("""
-<style>
-input[type="checkbox"] {
-    width: 16px;
-    height: 16px;
-    cursor: pointer;
-    accent-color: #7c3aed;
-}
-</style>
 """, unsafe_allow_html=True)
