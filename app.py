@@ -8,10 +8,9 @@ import pandas as pd
 import streamlit as st
 
 # ==============================================================================
-# 1. BACKEND: قاعدة البيانات وقواعد العمل (النظام الأساسي)
+# BACKEND: قاعدة البيانات وقواعد العمل
 # ==============================================================================
 DB_FILE = os.environ.get("ROFA_DB", "rofa_warehouse_v2.db")
-LEGACY_DB = "rofa_warehouse.db"
 
 DOC_TYPES = ["IN", "OUT", "RETURN_IN", "RETURN_OUT", "TRANSFER", "ADJUST"]
 DOC_PREFIX = {"IN": "IN", "OUT": "OUT", "RETURN_IN": "RIN", "RETURN_OUT": "ROUT", "TRANSFER": "TRF", "ADJUST": "ADJ"}
@@ -40,7 +39,7 @@ def q(sql, params=()):
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS warehouses(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, location TEXT, active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL);
-CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, category TEXT, unit TEXT NOT NULL DEFAULT 'Pcs', min_stock REAL NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, notes TEXT);
+CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, category TEXT, unit TEXT NOT NULL DEFAULT 'Pcs', min_stock REAL NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0, weight REAL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, notes TEXT);
 CREATE TABLE IF NOT EXISTS partners(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'SUPPLIER', phone TEXT, notes TEXT);
 CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY AUTOINCREMENT, doc_no TEXT UNIQUE NOT NULL, type TEXT NOT NULL, date TEXT NOT NULL, warehouse_id INTEGER NOT NULL REFERENCES warehouses(id), to_warehouse_id INTEGER REFERENCES warehouses(id), partner_id INTEGER REFERENCES partners(id), reference TEXT, notes TEXT, status TEXT NOT NULL DEFAULT 'Approved', created_at TEXT, cancelled_at TEXT);
 CREATE TABLE IF NOT EXISTS document_lines(id INTEGER PRIMARY KEY AUTOINCREMENT, document_id INTEGER NOT NULL REFERENCES documents(id), item_id INTEGER NOT NULL REFERENCES items(id), qty REAL NOT NULL, unit_cost REAL NOT NULL DEFAULT 0, batch_no TEXT, expiry TEXT);
@@ -62,7 +61,7 @@ def init_db():
         conn.close()
 
 def items_df(active_only=True):
-    sql = "SELECT id, code, name, category, unit, min_stock, cost, price, active, notes FROM items"
+    sql = "SELECT id, code, name, category, unit, min_stock, cost, price, weight, active, notes FROM items"
     if active_only: sql += " WHERE active=1"
     return q(sql + " ORDER BY code")
 
@@ -193,293 +192,573 @@ def ledger_df():
                 FROM ledger l JOIN documents d ON d.id = l.document_id JOIN items i ON i.id = l.item_id JOIN warehouses w ON w.id = l.warehouse_id
                 ORDER BY l.date DESC, l.id DESC""")
 
-def load_demo_data():
+def update_item_in_db(item_id, field, value):
+    """تحديث حقل معين في جدول الأصناف"""
     conn = connect()
     try:
-        if conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] > 0:
-            return False # Data already exists
-        conn.execute("INSERT INTO categories(name) VALUES ('مواد خام'), ('منتجات تامة'), ('مستلزمات')")
-        conn.execute("INSERT INTO warehouses(code, name, location) VALUES ('BR1', 'مخزن الفرع', 'الفرع الثاني')")
-        conn.execute("INSERT INTO partners(name, type, phone) VALUES ('شركة النور للتوريدات', 'SUPPLIER', '01000000001')")
-        conn.execute("INSERT INTO partners(name, type, phone) VALUES ('عميل - الشروق', 'CUSTOMER', '01000000003')")
-        
-        items = [("RM-001", "دقيق فاخر", "مواد خام", "كجم", 200, 18.0, 0.0), 
-                 ("RM-002", "سكر أبيض", "مواد خام", "كجم", 150, 24.0, 0.0),
-                 ("FG-001", "بسكويت سادة", "منتجات تامة", "علبة", 80, 12.0, 20.0),
-                 ("PK-001", "كرتونة تغليف", "مستلزمات", "قطعة", 300, 4.0, 0.0)]
-        for r in items:
-            conn.execute("INSERT INTO items(code, name, category, unit, min_stock, cost, price) VALUES (?,?,?,?,?,?,?)", r)
+        conn.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, item_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def add_product_to_inventory(code, name, category, unit, qty, weight, cost, price, min_stock, notes=""):
+    """إضافة منتج جديد للمخزون مع الكمية والوزن"""
+    conn = connect()
+    try:
+        # إضافة الصنف
+        conn.execute("""INSERT INTO items(code, name, category, unit, min_stock, cost, price, weight, notes) 
+                       VALUES (?,?,?,?,?,?,?,?,?)""", 
+                    (code, name, category, unit, min_stock, cost, price, weight, notes))
         conn.commit()
         
-        # Create an initial IN document
-        wh_main = conn.execute("SELECT id FROM warehouses WHERE code='MAIN'").fetchone()[0]
-        sup_id = conn.execute("SELECT id FROM partners WHERE type='SUPPLIER'").fetchone()[0]
-        item_ids = {r[0]: r[1] for r in conn.execute("SELECT code, id FROM items").fetchall()}
+        item_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         
-        lines = [{"item_id": item_ids["RM-001"], "qty": 500, "unit_cost": 18.0}, {"item_id": item_ids["RM-002"], "qty": 300, "unit_cost": 24.0}]
-        create_document("IN", date.today().isoformat(), wh_main, lines, partner_id=sup_id, reference="PO-1001")
-        return True
+        # إذا كانت هناك كمية، أضفها للمخزن
+        if qty > 0:
+            wh_id = conn.execute("SELECT id FROM warehouses WHERE code='MAIN'").fetchone()[0]
+            today = date.today().isoformat()
+            doc_no = next_doc_no(conn, "IN")
+            
+            # إنشاء مستند وارد
+            cur = conn.execute("""INSERT INTO documents(doc_no, type, date, warehouse_id, status, created_at)
+                                 VALUES (?, 'IN', ?, ?, 'Approved', ?)""",
+                             (doc_no, today, wh_id, datetime.now().isoformat(timespec="seconds")))
+            doc_id = cur.lastrowid
+            
+            # إضافة بند للمستند
+            conn.execute("""INSERT INTO document_lines(document_id, item_id, qty, unit_cost) 
+                           VALUES (?,?,?,?)""", (doc_id, item_id, qty, cost))
+            
+            # إضافة للحركة
+            conn.execute("""INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) 
+                           VALUES (?,?,?,?,?,?)""", (doc_id, item_id, wh_id, qty, 0, today))
+        
+        conn.commit()
+        return True, "تم إضافة المنتج بنجاح"
+    except sqlite3.IntegrityError:
+        return False, "كود الصنف موجود مسبقاً"
+    except Exception as e:
+        conn.rollback()
+        return False, f"خطأ: {str(e)}"
     finally:
         conn.close()
 
 # ==============================================================================
-# 2. FRONTEND: واجهة المستخدم الحديثة (Light Theme)
+# FRONTEND: واجهة المستخدم
 # ==============================================================================
-st.set_page_config(page_title="نظام Rofa للمخازن", page_icon="📦", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="نظام Rofa للمخازن", page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
 
-# Force Light Theme CSS
+# CSS Styling - Dark Blue Navigation & Editable Tables
 st.markdown("""
 <style>
-    /* Force Light Background Everywhere */
-    .stApp, .stApp > header, .stApp > div, .stApp > div > div, .main .block-container {
+    /* Force Light Background */
+    .stApp, .main .block-container {
         background-color: #f8fafc !important;
     }
+    
+    /* Dark Blue Navigation Bar - Full Width */
+    .nav-container {
+        display: flex;
+        gap: 8px;
+        padding: 16px 24px;
+        background-color: #1e3a8a;
+        border-radius: 12px;
+        margin-bottom: 24px;
+        box-shadow: 0 4px 6px rgba(30, 58, 138, 0.2);
+    }
+    
+    .nav-button {
+        flex: 1;
+        background-color: #1e40af;
+        color: white !important;
+        padding: 14px 24px;
+        border-radius: 8px;
+        text-align: center;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 15px;
+        transition: all 0.3s;
+        border: 2px solid transparent;
+    }
+    
+    .nav-button:hover {
+        background-color: #3b82f6;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+    }
+    
+    .nav-button.active {
+        background-color: #60a5fa;
+        border-color: #93c5fd;
+    }
+    
+    /* Sidebar Dark Blue */
     section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
-        background-color: #ffffff !important;
-        border-right: 1px solid #e2e8f0;
+        background-color: #1e3a8a !important;
     }
-    /* Inputs & Selects */
-    .stTextInput > div > div > input, .stNumberInput > div > div > input, .stSelectbox > div > div > div, .stTextArea > div > div > textarea {
-        background-color: #ffffff !important;
-        color: #1e293b !important;
-        border: 1px solid #e2e8f0 !important;
+    
+    section[data-testid="stSidebar"] .stRadio > div {
+        background-color: #1e40af;
+        border-radius: 8px;
+        padding: 8px;
+        margin: 4px 0;
     }
-    /* Buttons */
-    .stButton > button {
-        background-color: #ffffff !important;
-        color: #1e293b !important;
-        border: 1px solid #e2e8f0 !important;
+    
+    section[data-testid="stSidebar"] label {
+        color: white !important;
         font-weight: 600;
     }
-    .stButton > button:hover { background-color: #f1f5f9 !important; }
+    
+    /* Inputs & Selects */
+    .stTextInput > div > div > input, .stNumberInput > div > div > input, 
+    .stSelectbox > div > div > div, .stTextArea > div > div > textarea {
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+        border: 1px solid #cbd5e1 !important;
+    }
+    
+    /* Buttons */
+    .stButton > button {
+        background-color: #1e40af !important;
+        color: white !important;
+        border: none !important;
+        font-weight: 600;
+        padding: 10px 24px;
+        border-radius: 8px;
+    }
+    
+    .stButton > button:hover { 
+        background-color: #3b82f6 !important;
+        transform: translateY(-1px);
+    }
+    
     .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%) !important;
+        background: linear-gradient(135deg, #1e40af 0%, #3b82f6 100%) !important;
         color: white !important;
         border: none !important;
     }
+    
+    /* Editable Table Styling */
+    .editable-table {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        background: white;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        margin: 16px 0;
+    }
+    
+    .editable-table th {
+        background-color: #1e3a8a;
+        color: white;
+        padding: 14px 16px;
+        text-align: right;
+        font-weight: 600;
+        font-size: 14px;
+    }
+    
+    .editable-table td {
+        padding: 12px 16px;
+        border-bottom: 1px solid #e2e8f0;
+        background-color: white;
+    }
+    
+    .editable-table tr:hover td {
+        background-color: #f1f5f9;
+    }
+    
+    .editable-table input {
+        width: 100%;
+        padding: 8px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        font-size: 14px;
+    }
+    
+    .editable-table input:focus {
+        outline: none;
+        border-color: #3b82f6;
+        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+    }
+    
+    /* Stat Cards */
+    .stat-card {
+        background: white;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        text-align: center;
+        border-right: 4px solid #1e40af;
+    }
+    
+    .stat-value {
+        font-size: 32px;
+        font-weight: 700;
+        color: #1e40af;
+        margin: 8px 0;
+    }
+    
+    .stat-label {
+        font-size: 14px;
+        color: #64748b;
+        font-weight: 600;
+    }
+    
     /* Hide Streamlit Branding */
     #MainMenu, footer, header {visibility: hidden;}
     
-    /* Custom Components */
-    .stat-card {
-        background: white; border: 1px solid #e2e8f0; border-radius: 12px;
-        padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-align: center;
+    /* Section Headers */
+    .section-header {
+        background-color: #1e3a8a;
+        color: white;
+        padding: 12px 20px;
+        border-radius: 8px;
+        margin: 24px 0 16px 0;
+        font-size: 18px;
+        font-weight: 700;
     }
-    .stat-value { font-size: 28px; font-weight: 700; color: #1e293b; margin: 8px 0; }
-    .stat-label { font-size: 13px; color: #64748b; font-weight: 500; }
-    .badge-low { background-color: #fee2e2; color: #991b1b; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; }
-    .badge-ok { background-color: #dcfce7; color: #166534; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+    
+    /* Form Container */
+    .form-container {
+        background: white;
+        padding: 24px;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+        margin: 16px 0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # Initialize DB
 init_db()
 
-# Sidebar Navigation
-with st.sidebar:
-    st.markdown("""
-    <div style="display: flex; align-items: center; gap: 12px; padding: 20px 0; border-bottom: 1px solid #e2e8f0; margin-bottom: 20px;">
-        <div style="width: 40px; height: 40px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; display: flex; align-items: center; justify-content: center; color: white; font-size: 20px;">🏢</div>
-        <div><h3 style="margin: 0; font-size: 18px; color: #1e293b;">Rofa Warehouse</h3><p style="margin: 2px 0 0; font-size: 12px; color: #64748b;">نظام إدارة المخازن</p></div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    page = st.radio("القائمة الرئيسية", ["📊 لوحة التحكم", "📦 الأصناف والمخازن", "📝 إنشاء مستند جديد", "📋 سجل الحركات (Ledger)", "⚙️ الإعدادات"], label_visibility="collapsed")
+# Navigation State
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = "dashboard"
+
+# Navigation Bar
+nav_pages = {
+    "dashboard": "📊 لوحة التحكم",
+    "inventory": "📦 المخزون والمنتجات",
+    "add_product": " إضافة منتج",
+    "documents": " المستندات",
+    "ledger": "📋 سجل الحركات"
+}
+
+st.markdown('<div class="nav-container">', unsafe_allow_html=True)
+cols = st.columns(len(nav_pages))
+for idx, (page_key, page_name) in enumerate(nav_pages.items()):
+    with cols[idx]:
+        is_active = st.session_state.current_page == page_key
+        button_class = "nav-button active" if is_active else "nav-button"
+        if st.button(page_name, key=f"nav_{page_key}", use_container_width=True):
+            st.session_state.current_page = page_key
+            st.rerun()
+st.markdown('</div>', unsafe_allow_html=True)
 
 # ==============================================================================
-# 3. PAGES LOGIC
+# PAGES
 # ==============================================================================
 
-if page == "📊 لوحة التحكم":
-    st.markdown("<h2 style='color: #1e293b; margin-bottom: 24px;'>لوحة التحكم العامة</h2>", unsafe_allow_html=True)
+if st.session_state.current_page == "dashboard":
+    st.markdown('<div class="section-header">📊 لوحة التحكم العامة</div>', unsafe_allow_html=True)
     
     df_stock = stock_overview()
     total_items = len(df_stock)
     total_value = df_stock["value"].sum()
     low_stock_count = len(df_stock[df_stock["status"] == "low"])
+    total_qty = df_stock["qty"].sum()
     
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown(f"""<div class="stat-card"><div class="stat-label">إجمالي الأصناف</div><div class="stat-value">{total_items}</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="stat-card">
+            <div class="stat-label">إجمالي الأصناف</div>
+            <div class="stat-value">{total_items}</div>
+        </div>""", unsafe_allow_html=True)
     with c2:
-        st.markdown(f"""<div class="stat-card"><div class="stat-label">قيمة المخزون (تقريبي)</div><div class="stat-value">{total_value:,.0f} ج.م</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="stat-card">
+            <div class="stat-label">إجمالي الكمية</div>
+            <div class="stat-value">{total_qty:,.0f}</div>
+        </div>""", unsafe_allow_html=True)
     with c3:
-        st.markdown(f"""<div class="stat-card"><div class="stat-label">تنبيهات حد الأمان</div><div class="stat-value" style="color: #991b1b;">{low_stock_count}</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="stat-card">
+            <div class="stat-label">قيمة المخزون</div>
+            <div class="stat-value">{total_value:,.0f}</div>
+        </div>""", unsafe_allow_html=True)
+    with c4:
+        st.markdown(f"""<div class="stat-card">
+            <div class="stat-label">تنبيهات حد الأمان</div>
+            <div class="stat-value" style="color: #dc2626;">{low_stock_count}</div>
+        </div>""", unsafe_allow_html=True)
 
-    st.markdown("<h3 style='color: #1e293b; margin-top: 32px;'>📉 الأصناف التي وصلت لحد الأمان</h3>", unsafe_allow_html=True)
-    low_items = df_stock[df_stock["status"] == "low"][["code", "name", "category", "qty", "min_stock", "status"]]
+    st.markdown('<div class="section-header"> الأصناف التي وصلت لحد الأمان</div>', unsafe_allow_html=True)
+    low_items = df_stock[df_stock["status"] == "low"][["code", "name", "category", "qty", "min_stock", "unit"]]
     if not low_items.empty:
-        low_items["status"] = low_items["status"].apply(lambda x: '<span class="badge-low">منخفض</span>')
-        st.markdown(low_items.to_html(escape=False, index=False), unsafe_allow_html=True)
+        st.dataframe(low_items, use_container_width=True, hide_index=True)
     else:
         st.success("✅ جميع الأصناف متوفرة بكميات آمنة.")
 
-    st.markdown("<h3 style='color: #1e293b; margin-top: 32px;'>📄 آخر المستندات</h3>", unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📄 آخر المستندات</div>', unsafe_allow_html=True)
     recent_docs = documents_df().head(5)
     if not recent_docs.empty:
         st.dataframe(recent_docs, use_container_width=True, hide_index=True)
+    else:
+        st.info("لا توجد مستندات مسجلة حتى الآن.")
 
-elif page == "📦 الأصناف والمخازن":
-    st.markdown("<h2 style='color: #1e293b; margin-bottom: 24px;'>إدارة الأصناف</h2>", unsafe_allow_html=True)
+elif st.session_state.current_page == "inventory":
+    st.markdown('<div class="section-header">📦 إدارة المخزون والمنتجات</div>', unsafe_allow_html=True)
     
-    with st.expander("➕ إضافة صنف جديد", expanded=False):
-        with st.form("add_item"):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                code = st.text_input("كود الصنف *")
-                name = st.text_input("اسم الصنف *")
-            with c2:
-                category = st.text_input("التصنيف")
-                unit = st.text_input("الوحدة", value="Pcs")
-            with c3:
-                min_stock = st.number_input("حد الأمان", min_value=0.0, value=0.0)
-                cost = st.number_input("التكلفة القياسية", min_value=0.0, value=0.0)
-            
-            if st.form_submit_button("حفظ الصنف", type="primary"):
-                if code and name:
-                    try:
-                        conn = connect()
-                        conn.execute("INSERT INTO items(code, name, category, unit, min_stock, cost) VALUES (?,?,?,?,?,?)", (code, name, category, unit, min_stock, cost))
-                        conn.commit()
-                        conn.close()
-                        st.success("تم حفظ الصنف بنجاح!")
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.error("خطأ: كود الصنف موجود مسبقاً!")
+    # Editable Table
+    df_items = items_df(active_only=False)
+    
+    if not df_items.empty:
+        st.markdown("### 📋 جدول المنتجات (قابل للتعديل)")
+        st.markdown("يمكنك التعديل مباشرة في الجدول ثم الضغط على حفظ التغييرات")
+        
+        # Create editable dataframe
+        edited_df = st.data_editor(
+            df_items[['id', 'code', 'name', 'category', 'unit', 'min_stock', 'cost', 'price', 'weight', 'notes']],
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True),
+                "code": st.column_config.TextColumn("الكود"),
+                "name": st.column_config.TextColumn("الاسم"),
+                "category": st.column_config.TextColumn("التصنيف"),
+                "unit": st.column_config.TextColumn("الوحدة"),
+                "min_stock": st.column_config.NumberColumn("حد الأمان"),
+                "cost": st.column_config.NumberColumn("التكلفة"),
+                "price": st.column_config.NumberColumn("السعر"),
+                "weight": st.column_config.NumberColumn("الوزن"),
+                "notes": st.column_config.TextColumn("ملاحظات"),
+            },
+            hide_index=True,
+            use_container_width=True,
+            num_rows="dynamic"
+        )
+        
+        if st.button(" حفظ التغييرات", type="primary", use_container_width=True):
+            # Save changes
+            for index, row in edited_df.iterrows():
+                if index < len(df_items):
+                    orig_row = df_items.iloc[index]
+                    if not row.equals(orig_row):
+                        # Update changed fields
+                        for col in ['code', 'name', 'category', 'unit', 'min_stock', 'cost', 'price', 'weight', 'notes']:
+                            if row[col] != orig_row[col]:
+                                update_item_in_db(int(row['id']), col, row[col])
+            st.success("✅ تم حفظ التغييرات بنجاح!")
+            st.rerun()
+        
+        st.markdown("---")
+        
+        # Stock Overview
+        st.markdown("### 📊 حالة المخزون الحالية")
+        stock_df = stock_overview()
+        display_df = stock_df[['code', 'name', 'category', 'qty', 'unit', 'min_stock', 'status', 'value']].copy()
+        display_df['القيمة'] = display_df['value'].apply(lambda x: f"{x:,.2f}")
+        display_df['الحالة'] = display_df['status'].apply(lambda x: "⚠️ منخفض" if x == "low" else "✅ جيد" if x == "ok" else " نفد")
+        st.dataframe(display_df[['code', 'name', 'qty', 'unit', 'القيمة', 'الحالة']], use_container_width=True, hide_index=True)
+    else:
+        st.info("📭 لا توجد أصناف مسجلة. انتقل إلى صفحة 'إضافة منتج' لإضافة أصناف جديدة.")
+
+elif st.session_state.current_page == "add_product":
+    st.markdown('<div class="section-header"> إضافة منتج جديد للمخزون</div>', unsafe_allow_html=True)
+    
+    with st.form("add_product_form", clear_on_submit=False):
+        st.markdown('<div class="form-container">', unsafe_allow_html=True)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            code = st.text_input("كود الصنف *", placeholder="مثال: PRD-001")
+            name = st.text_input("اسم المنتج *", placeholder="مثال: منتج_example")
+            category = st.text_input("التصنيف", placeholder="مثال: إلكترونيات")
+        
+        with c2:
+            unit = st.selectbox("الوحدة", ["قطعة", "كجم", "لتر", "علبة", "كرتونة", "متر"])
+            min_stock = st.number_input("حد الأمان (الحد الأدنى)", min_value=0.0, value=0.0)
+        
+        st.markdown("#### 📦 الكمية والوزن")
+        st.markdown("اختر ما تريد إدخاله (الكمية أو الوزن أو الاثنين معاً)")
+        
+        c3, c4 = st.columns(2)
+        with c3:
+            use_qty = st.checkbox("إدخال الكمية", value=True)
+            qty = st.number_input("الكمية", min_value=0.0, value=0.0, disabled=not use_qty) if use_qty else 0
+        
+        with c4:
+            use_weight = st.checkbox("إدخال الوزن", value=False)
+            weight = st.number_input("الوزن", min_value=0.0, value=0.0, disabled=not use_weight) if use_weight else 0
+        
+        st.markdown("#### 💰 الأسعار")
+        c5, c6 = st.columns(2)
+        with c5:
+            cost = st.number_input("التكلفة", min_value=0.0, value=0.0, step=0.01)
+        with c6:
+            price = st.number_input("سعر البيع", min_value=0.0, value=0.0, step=0.01)
+        
+        notes = st.text_area("ملاحظات إضافية", placeholder="أي معلومات إضافية عن المنتج...")
+        
+        submitted = st.form_submit_button("✅ إضافة المنتج للمخزون", type="primary", use_container_width=True)
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        if submitted:
+            if not code or not name:
+                st.error("❌ يجب ملء حقلي الكود والاسم (الحقول المطلوبة)")
+            else:
+                success, message = add_product_to_inventory(
+                    code=code,
+                    name=name,
+                    category=category,
+                    unit=unit,
+                    qty=qty if use_qty else 0,
+                    weight=weight if use_weight else 0,
+                    cost=cost,
+                    price=price,
+                    min_stock=min_stock,
+                    notes=notes
+                )
+                
+                if success:
+                    st.success(f"✅ {message}")
+                    if qty > 0:
+                        st.info(f"📦 تم إضافة {qty} {unit} للمخزن الرئيسي")
+                    if weight > 0:
+                        st.info(f"⚖️ الوزن المسجل: {weight} كجم")
+                    st.balloons()
                 else:
-                    st.error("يجب ملء حقول الكود والاسم.")
+                    st.error(f" {message}")
 
-    st.markdown("<h3 style='color: #1e293b; margin-top: 24px;'>قائمة الأصناف الحالية</h3>", unsafe_allow_html=True)
-    st.dataframe(items_df(active_only=False), use_container_width=True, hide_index=True)
-
-elif page == "📝 إنشاء مستند جديد":
-    st.markdown("<h2 style='color: #1e293b; margin-bottom: 24px;'>إنشاء مستند مخزني</h2>", unsafe_allow_html=True)
+elif st.session_state.current_page == "documents":
+    st.markdown('<div class="section-header">📝 المستندات المخزنية</div>', unsafe_allow_html=True)
     
     if 'doc_lines' not in st.session_state:
         st.session_state.doc_lines = []
 
-    with st.form("doc_header"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            doc_type = st.selectbox("نوع المستند", ["IN", "OUT", "TRANSFER", "RETURN_IN", "RETURN_OUT"])
-        with c2:
-            doc_date = st.date_input("التاريخ", date.today())
-        with c3:
-            wh_df = warehouses_df()
-            wh_id = st.selectbox("المخزن", wh_df['id'].tolist(), format_func=lambda x: wh_df[wh_df['id']==x]['name'].values[0])
-        
-        to_wh_id = None
-        if doc_type == "TRANSFER":
-            to_wh_id = st.selectbox("المخزن المحول إليه", wh_df['id'].tolist(), format_func=lambda x: wh_df[wh_df['id']==x]['name'].values[0])
-            
-        partner_id = None
-        if doc_type in ["IN", "OUT", "RETURN_IN", "RETURN_OUT"]:
-            part_df = partners_df()
-            if not part_df.empty:
-                partner_id = st.selectbox("الجهة (مورد/عميل)", [None] + part_df['id'].tolist(), format_func=lambda x: "اختر جهة" if x is None else part_df[part_df['id']==x]['name'].values[0])
-                
-        reference = st.text_input("رقم مرجعي (فاتورة/أمر تشغيل)")
-        notes = st.text_input("ملاحظات")
-        
-        st.markdown("---")
-        st.markdown("##### إضافة بند للمستند")
-        items_list = items_df()
-        if items_list.empty:
-            st.warning("⚠️ يجب إضافة أصناف أولاً من صفحة 'الأصناف والمخازن'")
-        else:
-            item_options = {f"{row['code']} - {row['name']}": row['id'] for _, row in items_list.iterrows()}
-            c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+    # Create New Document
+    with st.expander("📝 إنشاء مستند جديد", expanded=True):
+        with st.form("doc_header"):
+            c1, c2, c3 = st.columns(3)
             with c1:
-                selected_item_name = st.selectbox("الصنف", list(item_options.keys()))
+                doc_type = st.selectbox("نوع المستند", ["IN (وارد)", "OUT (صادر)", "TRANSFER (تحويل)", "RETURN_IN (مرتجع وارد)", "RETURN_OUT (مرتجع صادر)"])
             with c2:
-                qty = st.number_input("الكمية", min_value=0.01, value=1.0)
+                doc_date = st.date_input("التاريخ", date.today())
             with c3:
-                cost = st.number_input("التكلفة", min_value=0.0, value=0.0)
-            with c4:
-                st.write("")
-                st.write("")
-                add_line = st.form_submit_button("إضافة للبند")
+                wh_df = warehouses_df()
+                wh_id = st.selectbox("المخزن", wh_df['id'].tolist(), format_func=lambda x: wh_df[wh_df['id']==x]['name'].values[0])
+            
+            to_wh_id = None
+            if "TRANSFER" in doc_type:
+                to_wh_id = st.selectbox("المخزن المحول إليه", wh_df['id'].tolist(), format_func=lambda x: wh_df[wh_df['id']==x]['name'].values[0])
                 
-            if add_line:
-                st.session_state.doc_lines.append({"item_id": item_options[selected_item_name], "qty": qty, "unit_cost": cost})
-                st.rerun()
+            partner_id = None
+            if "IN" in doc_type or "OUT" in doc_type or "RETURN" in doc_type:
+                part_df = partners_df()
+                if not part_df.empty:
+                    partner_id = st.selectbox("الجهة (مورد/عميل)", [None] + part_df['id'].tolist(), format_func=lambda x: "اختر جهة" if x is None else part_df[part_df['id']==x]['name'].values[0])
+                    
+            reference = st.text_input("رقم مرجعي (فاتورة/أمر تشغيل)")
+            notes = st.text_input("ملاحظات")
+            
+            st.markdown("---")
+            st.markdown("##### إضافة بند للمستند")
+            items_list = items_df()
+            if items_list.empty:
+                st.warning("⚠️ يجب إضافة أصناف أولاً من صفحة 'إضافة منتج'")
+            else:
+                item_options = {f"{row['code']} - {row['name']}": row['id'] for _, row in items_list.iterrows()}
+                c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+                with c1:
+                    selected_item_name = st.selectbox("الصنف", list(item_options.keys()), key="doc_item")
+                with c2:
+                    qty = st.number_input("الكمية", min_value=0.01, value=1.0, key="doc_qty")
+                with c3:
+                    cost = st.number_input("التكلفة", min_value=0.0, value=0.0, key="doc_cost")
+                with c4:
+                    st.write("")
+                    st.write("")
+                    add_line = st.form_submit_button("➕ إضافة", use_container_width=True)
+                    
+                if add_line:
+                    st.session_state.doc_lines.append({"item_id": item_options[selected_item_name], "qty": qty, "unit_cost": cost})
+                    st.rerun()
 
-    # Display added lines
-    if st.session_state.doc_lines:
-        lines_df = pd.DataFrame(st.session_state.doc_lines)
-        display_df = lines_df.merge(items_list[['id', 'code', 'name']], left_on='item_id', right_on='id')
-        st.dataframe(display_df[['code', 'name', 'qty', 'unit_cost']], use_container_width=True, hide_index=True)
-        
-        c1, c2 = st.columns([1, 5])
-        with c1:
-            if st.button("مسح البنود"):
-                st.session_state.doc_lines = []
-                st.rerun()
-        with c2:
-            if st.button("✅ اعتماد وحفظ المستند", type="primary"):
-                try:
-                    doc_id, doc_no = create_document(doc_type, doc_date, wh_id, st.session_state.doc_lines, to_warehouse_id=to_wh_id, partner_id=partner_id, reference=reference, notes=notes)
-                    st.success(f"تم إنشاء المستند بنجاح! رقم المستند: **{doc_no}**")
+        # Display added lines
+        if st.session_state.doc_lines:
+            lines_df = pd.DataFrame(st.session_state.doc_lines)
+            display_df = lines_df.merge(items_list[['id', 'code', 'name']], left_on='item_id', right_on='id')
+            st.dataframe(display_df[['code', 'name', 'qty', 'unit_cost']], use_container_width=True, hide_index=True)
+            
+            c1, c2 = st.columns([1, 5])
+            with c1:
+                if st.button("🗑️ مسح البنود"):
                     st.session_state.doc_lines = []
                     st.rerun()
-                except AppError as e:
-                    st.error(f"❌ خطأ في البيانات: {str(e)}")
-                except Exception as e:
-                    st.error(f"❌ خطأ في النظام: {str(e)}")
+            with c2:
+                if st.button("✅ اعتماد وحفظ المستند", type="primary", use_container_width=True):
+                    try:
+                        doc_type_code = doc_type.split(" ")[0]
+                        doc_id, doc_no = create_document(doc_type_code, doc_date, wh_id, st.session_state.doc_lines, to_warehouse_id=to_wh_id, partner_id=partner_id, reference=reference, notes=notes)
+                        st.success(f"✅ تم إنشاء المستند بنجاح! رقم المستند: **{doc_no}**")
+                        st.session_state.doc_lines = []
+                        st.rerun()
+                    except AppError as e:
+                        st.error(f"❌ خطأ في البيانات: {str(e)}")
+                    except Exception as e:
+                        st.error(f"❌ خطأ في النظام: {str(e)}")
 
-elif page == "📋 سجل الحركات (Ledger)":
-    st.markdown("<h2 style='color: #1e293b; margin-bottom: 24px;'>سجل حركات المخزن (Ledger)</h2>", unsafe_allow_html=True)
+    # Existing Documents
+    st.markdown("---")
+    st.markdown("### 📋 المستندات المسجلة")
+    docs_df = documents_df()
+    if not docs_df.empty:
+        st.dataframe(docs_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("لا توجد مستندات مسجلة حتى الآن.")
+
+elif st.session_state.current_page == "ledger":
+    st.markdown('<div class="section-header"> سجل الحركات المخزنية (Ledger)</div>', unsafe_allow_html=True)
     
     df_ledger = ledger_df()
     if not df_ledger.empty:
-        st.dataframe(df_ledger, use_container_width=True, hide_index=True)
+        # Editable Ledger
+        st.markdown("###  سجل الحركات (قابل للتعديل)")
         
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df_ledger.to_excel(writer, index=False, sheet_name="Ledger")
+        edited_ledger = st.data_editor(
+            df_ledger[['date', 'doc_no', 'type', 'status', 'warehouse', 'code', 'item', 'unit', 'in_qty', 'out_qty']],
+            column_config={
+                "date": st.column_config.DateColumn("التاريخ"),
+                "doc_no": st.column_config.TextColumn("رقم المستند", disabled=True),
+                "type": st.column_config.TextColumn("النوع", disabled=True),
+                "status": st.column_config.TextColumn("الحالة"),
+                "warehouse": st.column_config.TextColumn("المخزن", disabled=True),
+                "code": st.column_config.TextColumn("الكود", disabled=True),
+                "item": st.column_config.TextColumn("الصنف", disabled=True),
+                "unit": st.column_config.TextColumn("الوحدة", disabled=True),
+                "in_qty": st.column_config.NumberColumn("وارد"),
+                "out_qty": st.column_config.NumberColumn("صادر"),
+            },
+            hide_index=True,
+            use_container_width=True,
+            disabled=['doc_no', 'type', 'warehouse', 'code', 'item', 'unit']
+        )
         
         st.download_button(
             label="📥 تصدير السجل إلى Excel",
-            data=buf.getvalue(),
+            data=df_ledger.to_excel(index=False),
             file_name=f"rofa_ledger_{date.today().strftime('%Y%m%d')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
         )
     else:
-        st.info("لا توجد حركات مسجلة حتى الآن.")
+        st.info("📭 لا توجد حركات مسجلة حتى الآن.")
 
-elif page == "⚙️ الإعدادات":
-    st.markdown("<h2 style='color: #1e293b; margin-bottom: 24px;'>إعدادات النظام</h2>", unsafe_allow_html=True)
-    
-    st.markdown("### بيانات تجريبية")
-    st.write("استخدم هذا الزر لتعبئة النظام ببيانات تجريبية (أصناف، مخازن، موردين، وحركة أولية) لتجربة النظام.")
-    if st.button("تحميل البيانات التجريبية", type="primary"):
-        if load_demo_data():
-            st.success("تم تحميل البيانات التجريبية بنجاح! سيتم إعادة تحميل الصفحة.")
-            st.rerun()
-        else:
-            st.warning("النظام يحتوي بالفعل على بيانات. لم يتم إضافة بيانات تجريبية لتجنب التكرار.")
-
-    st.markdown("---")
-    st.markdown("### النسخ الاحتياطي")
-    st.write("قم بتحميل نسخة من قاعدة البيانات الحالية لحفظها بأمان.")
-    try:
-        conn = connect()
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-        tmp.close()
-        dst = sqlite3.connect(tmp.name)
-        conn.backup(dst)
-        dst.close()
-        conn.close()
-        
-        with open(tmp.name, "rb") as f:
-            db_bytes = f.read()
-        os.unlink(tmp.name)
-        
-        st.download_button(
-            label="💾 تحميل نسخة قاعدة البيانات (.db)",
-            data=db_bytes,
-            file_name=f"rofa_backup_{date.today().strftime('%Y%m%d')}.db",
-            mime="application/x-sqlite3"
-        )
-    except Exception as e:
-        st.error(f"فشل إنشاء النسخة: {e}")
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #64748b; padding: 20px; font-size: 14px;'>
+    <strong>نظام Rofa لإدارة المخازن</strong> | الإصدار 2.0 | © 2024
+</div>
+""", unsafe_allow_html=True)
