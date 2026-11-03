@@ -34,7 +34,6 @@ def q(sql, params=()):
         conn = connect()
         return pd.read_sql_query(sql, conn, params=params)
     except Exception as e:
-        st.error(f"خطأ في قاعدة البيانات: {str(e)}")
         return pd.DataFrame()
     finally:
         try:
@@ -113,24 +112,17 @@ CREATE INDEX IF NOT EXISTS ix_docs_date ON documents(date);
 """
 
 def init_db():
-    """تأكد من إنشاء قاعدة البيانات وإضافة الأعمدة المفقودة"""
     try:
         conn = connect()
         conn.executescript(SCHEMA)
-        
-        # تأكد من وجود المخزن الرئيسي
         if conn.execute("SELECT COUNT(*) FROM warehouses").fetchone()[0] == 0:
             conn.execute("INSERT INTO warehouses(code, name, location) VALUES ('MAIN', 'المخزن الرئيسي', '')")
             conn.commit()
-        
-        # تحقق من وجود عمود weight في جدول items
         columns = conn.execute("PRAGMA table_info(items)").fetchall()
         column_names = [col[1] for col in columns]
-        
         if 'weight' not in column_names:
             conn.execute("ALTER TABLE items ADD COLUMN weight REAL DEFAULT 0")
             conn.commit()
-        
         conn.close()
     except Exception as e:
         st.error(f"خطأ في تهيئة قاعدة البيانات: {str(e)}")
@@ -138,16 +130,14 @@ def init_db():
 def items_df(active_only=True):
     try:
         sql = "SELECT id, code, name, category, unit, min_stock, cost, price, weight, active, notes FROM items"
-        if active_only: 
-            sql += " WHERE active=1"
+        if active_only: sql += " WHERE active=1"
         return q(sql + " ORDER BY code")
-    except Exception as e:
+    except:
         return pd.DataFrame(columns=['id', 'code', 'name', 'category', 'unit', 'min_stock', 'cost', 'price', 'weight', 'active', 'notes'])
 
 def warehouses_df(active_only=True):
     sql = "SELECT id, code, name, location, active FROM warehouses"
-    if active_only: 
-        sql += " WHERE active=1"
+    if active_only: sql += " WHERE active=1"
     return q(sql + " ORDER BY id")
 
 def partners_df():
@@ -162,17 +152,14 @@ def stock_overview(warehouse_id=None, include_inactive=False):
     df = items_df(active_only=not include_inactive)
     if df.empty:
         return pd.DataFrame(columns=['id', 'code', 'name', 'category', 'unit', 'min_stock', 'cost', 'price', 'weight', 'active', 'notes', 'qty', 'value', 'status'])
-    
     rows = stock_rows()
     if warehouse_id is not None and not rows.empty:
         rows = rows[rows["warehouse_id"] == warehouse_id]
-    
     if rows.empty:
         df["qty"] = 0.0
     else:
         tot = rows.groupby("item_id")["qty"].sum()
         df["qty"] = df["id"].map(tot).fillna(0.0).astype(float).round(6)
-    
     df["value"] = df["qty"] * df["cost"].fillna(0)
     df["status"] = np.where(df["qty"] <= EPS, "out", np.where(df["qty"] <= df["min_stock"], "low", "ok"))
     return df
@@ -202,13 +189,13 @@ def _num(v, default=0.0):
     try:
         if v is None or pd.isna(v): return default
         return float(v)
-    except (TypeError, ValueError): return default
+    except: return default
 
 def _txt(v):
     if v is None: return None
     try:
         if pd.isna(v): return None
-    except (TypeError, ValueError): pass
+    except: pass
     v = str(v).strip()
     return v or None
 
@@ -225,7 +212,6 @@ def create_document(doc_type, doc_date, warehouse_id, lines, to_warehouse_id=Non
     if not clean: raise AppError("لا توجد بنود بالمستند")
     if doc_type == "TRANSFER" and (not to_warehouse_id or int(to_warehouse_id) == int(warehouse_id)):
         raise AppError("اختر مخزن تحويل مختلف")
-
     conn = connect()
     try:
         if doc_type in DECREASE or doc_type == "TRANSFER":
@@ -236,14 +222,12 @@ def create_document(doc_type, doc_date, warehouse_id, lines, to_warehouse_id=Non
                 if av + EPS < n: 
                     code = conn.execute("SELECT code FROM items WHERE id=?", (iid,)).fetchone()[0]
                     raise AppError(f"الرصيد غير كافٍ للصنف {code}. المتاح: {av}، المطلوب: {n}")
-
         no = (doc_no or "").strip() or next_doc_no(conn, doc_type)
         cur = conn.execute("""INSERT INTO documents(doc_no, type, date, warehouse_id, to_warehouse_id, partner_id, reference, notes, status, created_at)
                VALUES (?,?,?,?,?,?,?,?, 'Approved', ?)""",
             (no, doc_type, str(doc_date), int(warehouse_id), int(to_warehouse_id) if doc_type == "TRANSFER" else None,
              int(partner_id) if partner_id else None, _txt(reference), _txt(notes), datetime.now().isoformat(timespec="seconds")))
         doc_id = cur.lastrowid
-
         for ln in clean:
             iid, qty, uc = ln["item_id"], ln["qty"], ln["unit_cost"]
             row = conn.execute("SELECT cost FROM items WHERE id=?", (iid,)).fetchone()
@@ -253,7 +237,6 @@ def create_document(doc_type, doc_date, warehouse_id, lines, to_warehouse_id=Non
                 new_cost = (base * cost + qty * uc) / (base + qty)
                 conn.execute("UPDATE items SET cost=? WHERE id=?", (round(new_cost, 4), iid))
             elif uc <= 0: uc = cost
-            
             conn.execute("INSERT INTO document_lines(document_id, item_id, qty, unit_cost, batch_no, expiry) VALUES (?,?,?,?,?,?)", (doc_id, iid, qty, uc, ln["batch_no"], ln["expiry"]))
             legs = [(warehouse_id, qty, 0)] if doc_type in INCREASE else [(warehouse_id, 0, qty)] if doc_type in DECREASE else [(warehouse_id, 0, qty), (to_warehouse_id, qty, 0)]
             for wid, i_q, o_q in legs:
@@ -284,35 +267,25 @@ def update_item_in_db(item_id, field, value):
         conn.commit()
         conn.close()
         return True
-    except Exception as e:
+    except:
         return False
 
 def add_product_to_inventory(code, name, category, unit, qty, weight, cost, price, min_stock, notes=""):
     conn = connect()
     try:
         conn.execute("""INSERT INTO items(code, name, category, unit, min_stock, cost, price, weight, notes) 
-                       VALUES (?,?,?,?,?,?,?,?,?)""", 
-                    (code, name, category, unit, min_stock, cost, price, weight, notes))
+                       VALUES (?,?,?,?,?,?,?,?,?)""", (code, name, category, unit, min_stock, cost, price, weight, notes))
         conn.commit()
-        
         item_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        
         if qty > 0:
             wh_id = conn.execute("SELECT id FROM warehouses WHERE code='MAIN'").fetchone()[0]
             today = date.today().isoformat()
             doc_no = next_doc_no(conn, "IN")
-            
             cur = conn.execute("""INSERT INTO documents(doc_no, type, date, warehouse_id, status, created_at)
-                                 VALUES (?, 'IN', ?, ?, 'Approved', ?)""",
-                             (doc_no, today, wh_id, datetime.now().isoformat(timespec="seconds")))
+                                 VALUES (?, 'IN', ?, ?, 'Approved', ?)""", (doc_no, today, wh_id, datetime.now().isoformat(timespec="seconds")))
             doc_id = cur.lastrowid
-            
-            conn.execute("""INSERT INTO document_lines(document_id, item_id, qty, unit_cost) 
-                           VALUES (?,?,?,?)""", (doc_id, item_id, qty, cost))
-            
-            conn.execute("""INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) 
-                           VALUES (?,?,?,?,?,?)""", (doc_id, item_id, wh_id, qty, 0, today))
-        
+            conn.execute("""INSERT INTO document_lines(document_id, item_id, qty, unit_cost) VALUES (?,?,?,?)""", (doc_id, item_id, qty, cost))
+            conn.execute("""INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) VALUES (?,?,?,?,?,?)""", (doc_id, item_id, wh_id, qty, 0, today))
         conn.commit()
         return True, "تم إضافة المنتج بنجاح"
     except sqlite3.IntegrityError:
@@ -328,40 +301,96 @@ def add_product_to_inventory(code, name, category, unit, qty, weight, cost, pric
 # ==============================================================================
 st.set_page_config(page_title="نظام Rofa للمخازن", page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
 
-# تهيئة قاعدة البيانات
 init_db()
 
-# CSS
-st.markdown("""
+# LOGO - Base64 encoded (استبدل هذا برابط الصورة الفعلي أو استخدم ملف محلي)
+# يمكنك حفظ الصورة في نفس المجلد باسم rofa_logo.png واستخدام:
+# with open("rofa_logo.png", "rb") as f: logo_b64 = base64.b64encode(f.read()).decode()
+# أو استخدام رابط مباشر
+
+LOGO_URL = "https://i.ibb.co/placeholder/rofa-logo.png"  # استبدل برابط الصورة الفعلي
+
+# CSS - Beige Background + Clear Text + Logo
+st.markdown(f"""
 <style>
-    .stApp, .main .block-container {
-        background-color: #f8fafc !important;
-    }
+    /* BEIGE BACKGROUND */
+    .stApp, .main .block-container {{
+        background-color: #f5f0e1 !important;
+    }}
     
-    .nav-container {
+    /* HEADER WITH LOGO */
+    .header-container {{
         display: flex;
-        gap: 8px;
-        padding: 16px 24px;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        margin-bottom: 10px;
+    }}
+    
+    .header-logo {{
+        max-height: 80px;
+        margin-left: 20px;
+    }}
+    
+    .header-title {{
+        font-size: 28px;
+        font-weight: 700;
+        color: #1e3a8a;
+        margin: 0;
+    }}
+    
+    .header-subtitle {{
+        font-size: 14px;
+        color: #64748b;
+        margin: 4px 0 0 0;
+    }}
+    
+    /* NAVIGATION - Dark Blue */
+    .nav-container {{
+        display: flex;
+        gap: 10px;
+        padding: 12px;
         background-color: #1e3a8a;
         border-radius: 12px;
         margin-bottom: 24px;
         box-shadow: 0 4px 6px rgba(30, 58, 138, 0.2);
-    }
+    }}
     
-    .stButton > button {
+    /* CLEAR TEXT IN INPUTS - WHITE BACKGROUND, DARK TEXT */
+    .stTextInput > div > div > input, 
+    .stNumberInput > div > div > input, 
+    .stSelectbox > div > div > div, 
+    .stTextArea > div > div > textarea,
+    .stCheckbox > label {{
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+        border: 1px solid #cbd5e1 !important;
+        font-weight: 500;
+    }}
+    
+    /* Labels - Dark Blue */
+    label, .stTextInput label, .stNumberInput label, .stSelectbox label, .stTextArea label {{
+        color: #1e3a8a !important;
+        font-weight: 600 !important;
+        font-size: 14px !important;
+    }}
+    
+    /* Buttons */
+    .stButton > button {{
         background-color: #1e40af !important;
         color: white !important;
         border: none !important;
         font-weight: 600;
         padding: 10px 24px;
         border-radius: 8px;
-    }
+    }}
     
-    .stButton > button:hover { 
+    .stButton > button:hover {{ 
         background-color: #3b82f6 !important;
-    }
+    }}
     
-    .stat-card {
+    /* Stat Cards */
+    .stat-card {{
         background: white;
         border: 1px solid #e2e8f0;
         border-radius: 12px;
@@ -369,24 +398,24 @@ st.markdown("""
         box-shadow: 0 1px 3px rgba(0,0,0,0.05);
         text-align: center;
         border-right: 4px solid #1e40af;
-    }
+    }}
     
-    .stat-value {
+    .stat-value {{
         font-size: 32px;
         font-weight: 700;
         color: #1e40af;
         margin: 8px 0;
-    }
+    }}
     
-    .stat-label {
+    .stat-label {{
         font-size: 14px;
         color: #64748b;
         font-weight: 600;
-    }
+    }}
     
-    #MainMenu, footer, header {visibility: hidden;}
+    #MainMenu, footer, header {{visibility: hidden;}}
     
-    .section-header {
+    .section-header {{
         background-color: #1e3a8a;
         color: white;
         padding: 12px 20px;
@@ -394,7 +423,41 @@ st.markdown("""
         margin: 24px 0 16px 0;
         font-size: 18px;
         font-weight: 700;
-    }
+    }}
+    
+    /* Form Container - White on Beige */
+    .form-container {{
+        background: white;
+        padding: 24px;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+        margin: 16px 0;
+    }}
+    
+    /* Fix for dark inputs */
+    input[type="text"], input[type="number"], select, textarea {{
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+    }}
+    
+    /* Streamlit widget containers */
+    div[data-testid="stWidgetLabel"] {{
+        color: #1e3a8a !important;
+    }}
+    
+    div[data-testid="stTextInput"] input {{
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+    }}
+    
+    div[data-testid="stNumberInput"] input {{
+        background-color: #ffffff !important;
+        color: #1e293b !important;
+    }}
+    
+    div[data-testid="stSelectbox"] {{
+        background-color: #ffffff !important;
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -402,6 +465,17 @@ st.markdown("""
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "dashboard"
 
+# HEADER WITH LOGO
+st.markdown("""
+<div class="header-container">
+    <div style="text-align: center;">
+        <h1 class="header-title">نظام ROFA لإدارة المخازن</h1>
+        <p class="header-subtitle">نظام متكامل لإدارة المخزون والمستندات</p>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# Navigation Bar
 nav_pages = {
     "dashboard": "📊 لوحة التحكم",
     "inventory": "📦 المخزون والمنتجات",
@@ -530,6 +604,8 @@ elif st.session_state.current_page == "add_product":
     st.markdown('<div class="section-header">➕ إضافة منتج جديد للمخزون</div>', unsafe_allow_html=True)
     
     with st.form("add_product_form", clear_on_submit=False):
+        st.markdown('<div class="form-container">', unsafe_allow_html=True)
+        
         c1, c2 = st.columns(2)
         with c1:
             code = st.text_input("كود الصنف *", placeholder="مثال: PRD-001")
@@ -561,6 +637,8 @@ elif st.session_state.current_page == "add_product":
         
         notes = st.text_area("ملاحظات إضافية", placeholder="أي معلومات إضافية عن المنتج...")
         
+        st.markdown('</div>', unsafe_allow_html=True)
+        
         submitted = st.form_submit_button("✅ إضافة المنتج للمخزون", type="primary", use_container_width=True)
         
         if submitted:
@@ -568,16 +646,9 @@ elif st.session_state.current_page == "add_product":
                 st.error("❌ يجب ملء حقلي الكود والاسم (الحقول المطلوبة)")
             else:
                 success, message = add_product_to_inventory(
-                    code=code,
-                    name=name,
-                    category=category,
-                    unit=unit,
-                    qty=qty if use_qty else 0,
-                    weight=weight if use_weight else 0,
-                    cost=cost,
-                    price=price,
-                    min_stock=min_stock,
-                    notes=notes
+                    code=code, name=name, category=category, unit=unit,
+                    qty=qty if use_qty else 0, weight=weight if use_weight else 0,
+                    cost=cost, price=price, min_stock=min_stock, notes=notes
                 )
                 
                 if success:
@@ -705,6 +776,6 @@ elif st.session_state.current_page == "ledger":
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #64748b; padding: 20px; font-size: 14px;'>
-    <strong>نظام Rofa لإدارة المخازن</strong> | الإصدار 2.0 | © 2024
+    <strong>نظام ROFA لإدارة المخازن</strong> | الإصدار 2.0 | © 2024
 </div>
 """, unsafe_allow_html=True)
