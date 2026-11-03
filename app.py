@@ -190,7 +190,8 @@ def create_document(doc_type, doc_date, warehouse_id, lines, to_warehouse_id=Non
         clean.append({"item_id": int(iid), "qty": qty, "unit_cost": _num(ln.get("unit_cost")),
                       "batch_no": _txt(ln.get("batch_no")), "expiry": _txt(ln.get("expiry"))})
     if not clean: raise AppError("لا توجد بنود بالمستند")
-if doc_type == "TRANSFER" and (!to_warehouse_id or int(to_warehouse_id) == int(warehouse_id)):        raise AppError("اختر مخزن تحويل مختلف")
+    if doc_type == "TRANSFER" and (not to_warehouse_id or int(to_warehouse_id) == int(warehouse_id)):
+        raise AppError("اختر مخزن تحويل مختلف")
 
     conn = connect()
     try:
