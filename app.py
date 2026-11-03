@@ -11,10 +11,10 @@ import streamlit as st
 # PAGE CONFIGURATION & INITIALIZATION
 # ----------------------------------------------------------------
 st.set_page_config(
-    page_title="Rofa Warehouse System",
+    page_title="Rofa-warehouse System",
     page_icon="📦",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 DB_FILE = os.environ.get("ROFA_DB", "rofa_warehouse_v2.db")
@@ -97,12 +97,48 @@ def init_db():
         if conn.execute("SELECT COUNT(*) FROM warehouses").fetchone()[0] == 0:
             conn.execute("INSERT INTO warehouses(code, name, location) VALUES ('MAIN', 'المخزن الرئيسي', '')")
         conn.commit()
+        _migrate_legacy(conn)
     finally:
         conn.close()
 
+def _migrate_legacy(conn):
+    if not os.path.exists(LEGACY_DB) or os.path.abspath(LEGACY_DB) == os.path.abspath(DB_FILE):
+        return
+    if conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] > 0:
+        return
+    old = None
+    try:
+        old = sqlite3.connect(LEGACY_DB)
+        tables = {r[0] for r in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"items", "stock_documents", "stock_ledger"} <= tables:
+            return
+        wh = conn.execute("SELECT id FROM warehouses ORDER BY id LIMIT 1").fetchone()[0]
+        for r in old.execute("SELECT id, code, name, unit, min_stock, notes FROM items"):
+            conn.execute("INSERT INTO items(id, code, name, unit, min_stock, notes) VALUES (?,?,?,?,?,?)", r)
+        tmap = {"IN": "IN", "OUT": "OUT", "RETURN": "RETURN_IN", "ADJUST": "ADJUST"}
+        for r in old.execute("SELECT id, doc_no, type, date, reference, status FROM stock_documents"):
+            conn.execute(
+                "INSERT INTO documents(id, doc_no, type, date, warehouse_id, reference, status, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (r[0], r[1], tmap.get(r[2], r[2]), r[3], wh, r[4], r[5] or "Approved", r[3]))
+        for r in old.execute("SELECT document_id, item_id, qty, batch_no FROM stock_document_items"):
+            conn.execute("INSERT INTO document_lines(document_id, item_id, qty, batch_no) VALUES (?,?,?,?)", r)
+        for r in old.execute("SELECT item_id, in_qty, out_qty, document_id, date FROM stock_ledger"):
+            conn.execute(
+                "INSERT INTO ledger(item_id, in_qty, out_qty, document_id, warehouse_id, date) VALUES (?,?,?,?,?,?)",
+                (r[0], r[1] or 0, r[2] or 0, r[3], wh, r[4] or date.today().isoformat()))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        if old is not None:
+            old.close()
+
 init_db()
 
-# Backend Helper Functions
+# ----------------------------------------------------------------
+# DATA HELPERS
+# ----------------------------------------------------------------
 def items_df(active_only=True):
     sql = "SELECT id, code, name, category, unit, min_stock, cost, price, active, notes FROM items"
     if active_only:
@@ -178,20 +214,25 @@ def _txt(v):
     v = str(v).strip()
     return v or None
 
+def _item_code(conn, item_id):
+    r = conn.execute("SELECT code FROM items WHERE id=?", (item_id,)).fetchone()
+    return r[0] if r else str(item_id)
+
 def create_document(doc_type, doc_date, warehouse_id, lines, to_warehouse_id=None, partner_id=None, reference="", notes="", doc_no=None):
     if doc_type not in DOC_TYPES or doc_type == "ADJUST":
-        raise AppError("نوع المستند غير صحيح")
+        raise AppError("err_bad_type")
     clean = []
     for ln in lines:
         iid = ln.get("item_id")
         if iid is None or (isinstance(iid, float) and pd.isna(iid)): continue
         qty = _num(ln.get("qty"))
-        if qty <= 0: raise AppError("الكمية يجب أن تكون أكبر من الصفر")
+        if qty <= 0: raise AppError("err_qty_positive")
         clean.append({"item_id": int(iid), "qty": qty, "unit_cost": _num(ln.get("unit_cost")),
                       "batch_no": _txt(ln.get("batch_no")), "expiry": _txt(ln.get("expiry"))})
-    if not clean: raise AppError("لا توجد بنود بالمستند")
-    if doc_type == "TRANSFER" and (not to_warehouse_id or int(to_warehouse_id) == int(warehouse_id)):
-        raise AppError("اختر مخزن تحويل مختلف")
+    if not clean: raise AppError("err_no_lines")
+    if doc_type == "TRANSFER":
+        if not to_warehouse_id or int(to_warehouse_id) == int(warehouse_id):
+            raise AppError("err_transfer_wh")
 
     conn = connect()
     try:
@@ -200,9 +241,12 @@ def create_document(doc_type, doc_date, warehouse_id, lines, to_warehouse_id=Non
             for ln in clean: need[ln["item_id"]] = need.get(ln["item_id"], 0) + ln["qty"]
             for iid, n in need.items():
                 av = available(conn, iid, warehouse_id)
-                if av + EPS < n: raise AppError(f"الرصيد غير كافٍ للصنف ID: {iid}. المتاح: {av}، المطلوب: {n}")
+                if av + EPS < n: raise AppError("err_insufficient", item=_item_code(conn, iid), avail=av, need=n)
 
         no = (doc_no or "").strip() or next_doc_no(conn, doc_type)
+        if conn.execute("SELECT 1 FROM documents WHERE doc_no=?", (no,)).fetchone():
+            raise AppError("err_doc_exists", doc_no=no)
+
         cur = conn.execute(
             """INSERT INTO documents(doc_no, type, date, warehouse_id, to_warehouse_id, partner_id, reference, notes, status, created_at)
                VALUES (?,?,?,?,?,?,?,?, 'Approved', ?)""",
@@ -215,20 +259,21 @@ def create_document(doc_type, doc_date, warehouse_id, lines, to_warehouse_id=Non
         for ln in clean:
             iid, qty, uc = ln["item_id"], ln["qty"], ln["unit_cost"]
             row = conn.execute("SELECT cost FROM items WHERE id=?", (iid,)).fetchone()
-            cost = row[0] if row else 0.0
+            if row is None: raise AppError("err_item_missing")
+            cost = row[0] or 0.0
             if doc_type == "IN" and uc > 0:
                 base = max(total_qty(conn, iid), 0.0)
                 new_cost = (base * cost + qty * uc) / (base + qty)
                 conn.execute("UPDATE items SET cost=? WHERE id=?", (round(new_cost, 4), iid))
             elif uc <= 0: uc = cost
-            
-            conn.execute("INSERT INTO document_lines(document_id, item_id, qty, unit_cost, batch_no, expiry) VALUES (?,?,?,?,?,?)",
-                         (doc_id, iid, qty, uc, ln["batch_no"], ln["expiry"]))
-            
+            conn.execute(
+                "INSERT INTO document_lines(document_id, item_id, qty, unit_cost, batch_no, expiry) VALUES (?,?,?,?,?,?)",
+                (doc_id, iid, qty, uc, ln["batch_no"], ln["expiry"]))
             legs = [(warehouse_id, qty, 0)] if doc_type in INCREASE else [(warehouse_id, 0, qty)] if doc_type in DECREASE else [(warehouse_id, 0, qty), (to_warehouse_id, qty, 0)]
             for wid, i_q, o_q in legs:
-                conn.execute("INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) VALUES (?,?,?,?,?,?)",
-                             (doc_id, iid, int(wid), i_q, o_q, str(doc_date)))
+                conn.execute(
+                    "INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) VALUES (?,?,?,?,?,?)",
+                    (doc_id, iid, int(wid), i_q, o_q, str(doc_date)))
         conn.commit()
         return doc_id, no
     except Exception:
@@ -256,8 +301,9 @@ def create_adjustment(warehouse_id, counts, notes="", doc_date=None):
         for iid, diff in changes:
             cost = conn.execute("SELECT cost FROM items WHERE id=?", (iid,)).fetchone()[0] or 0.0
             conn.execute("INSERT INTO document_lines(document_id, item_id, qty, unit_cost) VALUES (?,?,?,?)", (doc_id, iid, diff, cost))
-            conn.execute("INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) VALUES (?,?,?,?,?,?)",
-                         (doc_id, iid, int(warehouse_id), max(diff, 0), max(-diff, 0), doc_date))
+            conn.execute(
+                "INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) VALUES (?,?,?,?,?,?)",
+                (doc_id, iid, int(warehouse_id), max(diff, 0), max(-diff, 0), doc_date))
         conn.commit()
         return no, len(changes)
     except Exception:
@@ -266,130 +312,56 @@ def create_adjustment(warehouse_id, counts, notes="", doc_date=None):
     finally:
         conn.close()
 
-def ledger_df():
-    return q("""SELECT l.id AS ledger_id, l.date, d.doc_no, d.type, d.status, d.reference,
+def ledger_df(include_cancelled=False):
+    df = q("""SELECT l.id AS ledger_id, l.date, d.doc_no, d.type, d.status, d.reference,
                        l.warehouse_id, w.name AS warehouse, l.item_id, i.code, i.name AS item, i.unit,
                        l.in_qty, l.out_qty, p.name AS partner
-                FROM ledger l
-                JOIN documents d ON d.id = l.document_id
-                JOIN items i ON i.id = l.item_id
-                JOIN warehouses w ON w.id = l.warehouse_id
-                LEFT JOIN partners p ON p.id = d.partner_id
-                ORDER BY l.date DESC, l.id DESC""")
+              FROM ledger l
+              JOIN documents d ON d.id = l.document_id
+              JOIN items i ON i.id = l.item_id
+              JOIN warehouses w ON w.id = l.warehouse_id
+              LEFT JOIN partners p ON p.id = d.partner_id
+              ORDER BY l.date DESC, l.id DESC""")
+    if df.empty:
+        df["balance"] = pd.Series(dtype=float)
+        return df
+    net = np.where(df["status"] == "Approved", df["in_qty"] - df["out_qty"], 0.0)
+    df["balance"] = pd.Series(net, index=df.index).groupby([df["item_id"], df["warehouse_id"]]).cumsum().round(6)
+    if not include_cancelled:
+        df = df[df["status"] == "Approved"]
+    return df
 
 # ----------------------------------------------------------------
-# MULTI-LANGUAGE TRANSLATIONS
+# MULTI-LANGUAGE TRANSLATIONS & UI
 # ----------------------------------------------------------------
 LANG = {
     "ar": {
-        "title": "نظام Rofa لإدارة المخازن",
-        "subtitle": "Logistics Manager",
-        "nav_dash": "Dashboard",
-        "nav_items": "Inventory",
-        "nav_notifications": "Notifications",
-        "nav_shipments": "Shipments",
-        "nav_receiving": "Receiving",
-        "nav_zones": "Zones & Locations",
-        "nav_suppliers": "Suppliers",
-        "nav_reports": "Reports",
-        "nav_dispatch": "DISPATCH",
-        "nav_driver_radio": "Driver Radio",
-        "nav_manifests": "Manifests",
-        "nav_pinned": "PINNED ROUTERS",
-        "nav_add_route": "Add new route",
-        "nav_help": "Help Center",
-        "total_items": "Total Items",
-        "total_qty": "Total Stock Qty",
-        "low_stock": "Min Stock Alert ⚠️",
-        "current_stock_title": "Current Inventory Status",
-        "no_items": "No items recorded yet.",
-        "lang_btn": "English 🇺🇸",
-        "pending_inbound": "Pending Inbound",
-        "processing": "Processing",
-        "awaiting_pickup": "Awaiting Pickup",
-        "completed": "Completed",
-        "delayed": "Delayed",
-        "ai_notification": "24 shipments are currently being routed by AI Agent automatically",
-        "dismiss": "Dismiss",
-        "view_log": "View Log →",
-        "shipment_id": "Shipment ID",
-        "description": "Description",
-        "location": "Location",
-        "type": "Type",
-        "priority": "Priority",
-        "carrier": "Carrier",
-        "contact": "Contact",
-        "urgent": "Urgent",
-        "high": "High",
-        "medium": "Medium",
-        "low": "Low",
-        "outbound": "Outbound",
-        "inbound": "Inbound",
-        "transfer": "Transfer",
-        "return": "Return",
-        "scan_barcode": "Scan Barcode",
-        "new_shipment": "+ New Shipment",
-        "last_7_days": "Last 7 Days",
-        "daily": "Daily",
-        "priority_filter": "Priority",
-        "page": "Page",
-        "of": "of",
-        "rows_per_page": "Rows per page"
+        "title": "نظام Rofa-warehouse لإدارة المخازن والدورة المستندية",
+        "nav_dash": "📊 لوحة التحكم والأرصدة",
+        "nav_items": "🏷️ إدارة الأصناف والجهات",
+        "nav_docs": "🔄 الدورات المستندية (وارد/صادر/تحويل)",
+        "nav_ledger": "📋 سجل الحركات والتصدير",
+        "nav_audit": "⚖️ الجرد والتسوية الآلية",
+        "total_items": "إجمالي الأصناف المعرفة",
+        "total_qty": "إجمالي كمية المخزون",
+        "low_stock": "أصناف بلغت حد الأمان ⚠️",
+        "current_stock_title": "موقف المخزون الحالي",
+        "no_items": "لا توجد أصناف مسجلة حتى الآن.",
+        "lang_btn": "English 🇺🇸"
     },
     "en": {
-        "title": "Central Warehouse",
-        "subtitle": "Logistics Manager",
-        "nav_dash": "Dashboard",
-        "nav_items": "Inventory",
-        "nav_notifications": "Notifications",
-        "nav_shipments": "Shipments",
-        "nav_receiving": "Receiving",
-        "nav_zones": "Zones & Locations",
-        "nav_suppliers": "Suppliers",
-        "nav_reports": "Reports",
-        "nav_dispatch": "DISPATCH",
-        "nav_driver_radio": "Driver Radio",
-        "nav_manifests": "Manifests",
-        "nav_pinned": "PINNED ROUTERS",
-        "nav_add_route": "Add new route",
-        "nav_help": "Help Center",
+        "title": "Rofa-warehouse Management System",
+        "nav_dash": "📊 Dashboard & Stock",
+        "nav_items": "🏷️ Master Data (Items & Partners)",
+        "nav_docs": "🔄 Document Workflows (In/Out/Trf)",
+        "nav_ledger": "📋 Master Ledger & Export",
+        "nav_audit": "⚖️ Stock Audit & Adjustment",
         "total_items": "Total Items",
         "total_qty": "Total Stock Qty",
         "low_stock": "Min Stock Alert ⚠️",
         "current_stock_title": "Current Inventory Status",
         "no_items": "No items recorded yet.",
-        "lang_btn": "العربية 🇪🇬",
-        "pending_inbound": "Pending Inbound",
-        "processing": "Processing",
-        "awaiting_pickup": "Awaiting Pickup",
-        "completed": "Completed",
-        "delayed": "Delayed",
-        "ai_notification": "24 shipments are currently being routed by AI Agent automatically",
-        "dismiss": "Dismiss",
-        "view_log": "View Log →",
-        "shipment_id": "Shipment ID",
-        "description": "Description",
-        "location": "Location",
-        "type": "Type",
-        "priority": "Priority",
-        "carrier": "Carrier",
-        "contact": "Contact",
-        "urgent": "Urgent",
-        "high": "High",
-        "medium": "Medium",
-        "low": "Low",
-        "outbound": "Outbound",
-        "inbound": "Inbound",
-        "transfer": "Transfer",
-        "return": "Return",
-        "scan_barcode": "Scan Barcode",
-        "new_shipment": "+ New Shipment",
-        "last_7_days": "Last 7 Days",
-        "daily": "Daily",
-        "priority_filter": "Priority",
-        "page": "Page",
-        "of": "of",
-        "rows_per_page": "Rows per page"
+        "lang_btn": "العربية 🇪🇬"
     }
 }
 
@@ -400,675 +372,201 @@ t = LANG[st.session_state.lang]
 is_ar = st.session_state.lang == 'ar'
 direction = "rtl" if is_ar else "ltr"
 
-# FORCE LIGHT THEME - Strong CSS Override
-st.markdown("""
-<style>
-    /* FORCE LIGHT MODE ON EVERYTHING */
-    .stApp, .stApp > header, .stApp > div, .stApp > div > div {
-        background-color: #f8fafc !important;
-    }
-    
-    /* Sidebar Light Background */
-    section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
-        background-color: #ffffff !important;
-    }
-    
-    /* Main Content Area */
-    .main .block-container {
-        background-color: #f8fafc !important;
-    }
-    
-    /* All containers */
-    div[data-testid="stVerticalBlock"], div[data-testid="stHorizontalBlock"] {
-        background-color: transparent !important;
-    }
-    
-    /* Streamlit buttons light */
-    .stButton > button {
-        background-color: #ffffff !important;
-        color: #1e293b !important;
-        border: 1px solid #e2e8f0 !important;
-    }
-    
-    .stButton > button:hover {
-        background-color: #f1f5f9 !important;
-    }
-    
-    .stButton > button[kind="primary"] {
-        background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%) !important;
-        color: white !important;
-        border: none !important;
-    }
-    
-    /* Text inputs light */
-    .stTextInput > div > div > input {
-        background-color: #ffffff !important;
-        color: #1e293b !important;
-        border: 1px solid #e2e8f0 !important;
-    }
-    
-    /* Select boxes light */
-    .stSelectbox > div > div > div {
-        background-color: #ffffff !important;
-        color: #1e293b !important;
-    }
-    
-    /* Number inputs light */
-    .stNumberInput > div > div > input {
-        background-color: #ffffff !important;
-        color: #1e293b !important;
-    }
-    
-    /* Hide default Streamlit elements */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-</style>
-""", unsafe_allow_html=True)
-
-# Modern UI Styling
 st.markdown(f"""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    
-    * {{
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    body, html, [class*="css"] {{
+        direction: {direction};
+        text-align: {"right" if is_ar else "left"};
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
     }}
-    
-    /* Header Section */
-    .warehouse-header {{
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 20px 24px;
-        border-bottom: 1px solid #e2e8f0;
-        margin-bottom: 20px;
-        background-color: #ffffff;
-    }}
-    
-    .warehouse-icon {{
-        width: 40px;
-        height: 40px;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 10px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
+    .metric-card {{
+        background-color: #1e293b;
         color: white;
-        font-size: 20px;
-    }}
-    
-    .warehouse-title h2 {{
-        margin: 0;
-        font-size: 18px;
-        font-weight: 600;
-        color: #1e293b;
-    }}
-    
-    .warehouse-title p {{
-        margin: 2px 0 0 0;
-        font-size: 13px;
-        color: #64748b;
-        font-weight: 500;
-    }}
-    
-    /* Stat Cards */
-    .stat-card {{
-        background: white;
-        border: 1px solid #e2e8f0;
-        border-radius: 12px;
         padding: 20px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-        transition: all 0.2s;
-    }}
-    
-    .stat-card:hover {{
-        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-        transform: translateY(-2px);
-    }}
-    
-    .stat-label {{
-        font-size: 13px;
-        color: #64748b;
-        font-weight: 500;
-        margin-bottom: 8px;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-    }}
-    
-    .stat-value {{
-        font-size: 28px;
-        font-weight: 700;
-        color: #1e293b;
-        margin-bottom: 8px;
-    }}
-    
-    .stat-trend {{
-        font-size: 12px;
-        font-weight: 600;
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        padding: 4px 8px;
-        border-radius: 6px;
-    }}
-    
-    .trend-up {{
-        background-color: #dcfce7;
-        color: #166534;
-    }}
-    
-    .trend-down {{
-        background-color: #fee2e2;
-        color: #991b1b;
-    }}
-    
-    /* Notification Banner */
-    .notification-banner {{
-        background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
-        color: white;
-        padding: 14px 20px;
-        border-radius: 10px;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 24px;
-        box-shadow: 0 4px 6px rgba(124, 58, 237, 0.2);
-    }}
-    
-    .notification-content {{
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        font-weight: 500;
-    }}
-    
-    .notification-actions {{
-        display: flex;
-        gap: 12px;
-    }}
-    
-    .notification-btn {{
-        background: rgba(255,255,255,0.2);
-        border: none;
-        color: white;
-        padding: 6px 12px;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 13px;
-        font-weight: 500;
-        transition: all 0.2s;
-    }}
-    
-    .notification-btn:hover {{
-        background: rgba(255,255,255,0.3);
-    }}
-    
-    /* Filter Bar */
-    .filter-bar {{
-        display: flex;
-        gap: 12px;
-        margin-bottom: 20px;
-        flex-wrap: wrap;
-    }}
-    
-    .filter-select {{
-        background: white;
-        border: 1px solid #e2e8f0;
-        border-radius: 8px;
-        padding: 8px 16px;
-        font-size: 13px;
-        font-weight: 500;
-        color: #475569;
-        cursor: pointer;
-        transition: all 0.2s;
-    }}
-    
-    .filter-select:hover {{
-        border-color: #cbd5e1;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-    }}
-    
-    /* Table Styling */
-    .modern-table {{
-        width: 100%;
-        border-collapse: separate;
-        border-spacing: 0;
-        background: white;
         border-radius: 12px;
-        overflow: hidden;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    }}
-    
-    .modern-table th {{
-        background-color: #f8fafc;
-        padding: 12px 16px;
-        text-align: left;
-        font-size: 12px;
-        font-weight: 600;
-        color: #64748b;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        border-bottom: 1px solid #e2e8f0;
-    }}
-    
-    .modern-table td {{
-        padding: 14px 16px;
-        border-bottom: 1px solid #f1f5f9;
-        font-size: 14px;
-        color: #334155;
-        background-color: white;
-    }}
-    
-    .modern-table tr:hover td {{
-        background-color: #f8fafc;
-    }}
-    
-    .modern-table tr:last-child td {{
-        border-bottom: none;
-    }}
-    
-    /* Status Badges */
-    .badge {{
-        display: inline-flex;
-        align-items: center;
-        padding: 6px 12px;
-        border-radius: 8px;
-        font-size: 12px;
-        font-weight: 600;
-        letter-spacing: 0.3px;
-    }}
-    
-    .badge-urgent {{
-        background-color: #fef3c7;
-        color: #92400e;
-    }}
-    
-    .badge-high {{
-        background-color: #ffedd5;
-        color: #c2410c;
-    }}
-    
-    .badge-medium {{
-        background-color: #dbeafe;
-        color: #1e40af;
-    }}
-    
-    .badge-low {{
-        background-color: #d1fae5;
-        color: #047857;
-    }}
-    
-    /* Carrier Badge */
-    .carrier-badge {{
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 12px;
-        background: #f1f5f9;
-        border-radius: 8px;
-        font-size: 13px;
-        font-weight: 500;
-        color: #475569;
-    }}
-    
-    .carrier-icon {{
-        width: 24px;
-        height: 24px;
-        border-radius: 6px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-weight: 700;
-        font-size: 11px;
-        color: white;
-    }}
-    
-    /* Type Icons */
-    .type-icon {{
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 13px;
-        font-weight: 500;
-    }}
-    
-    .type-outbound {{ color: #059669; }}
-    .type-inbound {{ color: #2563eb; }}
-    .type-transfer {{ color: #d97706; }}
-    .type-return {{ color: #dc2626; }}
-    
-    /* Buttons */
-    .btn-primary {{
-        background: linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%);
-        color: white;
-        border: none;
-        padding: 10px 20px;
-        border-radius: 8px;
-        font-weight: 600;
-        font-size: 14px;
-        cursor: pointer;
-        transition: all 0.2s;
-        box-shadow: 0 2px 4px rgba(124, 58, 237, 0.3);
-    }}
-    
-    .btn-primary:hover {{
-        transform: translateY(-1px);
-        box-shadow: 0 4px 8px rgba(124, 58, 237, 0.4);
-    }}
-    
-    .btn-secondary {{
-        background: white;
-        color: #475569;
-        border: 1px solid #e2e8f0;
-        padding: 10px 20px;
-        border-radius: 8px;
-        font-weight: 600;
-        font-size: 14px;
-        cursor: pointer;
-        transition: all 0.2s;
-    }}
-    
-    .btn-secondary:hover {{
-        background: #f8fafc;
-        border-color: #cbd5e1;
-    }}
-    
-    /* Top Actions */
-    .top-actions {{
-        display: flex;
-        gap: 12px;
-        margin-bottom: 24px;
-    }}
-    
-    /* Page Title */
-    .page-title {{
-        font-size: 24px;
-        font-weight: 700;
-        color: #1e293b;
-        margin-bottom: 24px;
-    }}
-    
-    /* Custom Scrollbar */
-    ::-webkit-scrollbar {{
-        width: 8px;
-        height: 8px;
-    }}
-    
-    ::-webkit-scrollbar-track {{
-        background: #f1f5f9;
-        border-radius: 4px;
-    }}
-    
-    ::-webkit-scrollbar-thumb {{
-        background: #cbd5e1;
-        border-radius: 4px;
-    }}
-    
-    ::-webkit-scrollbar-thumb:hover {{
-        background: #94a3b8;
-    }}
-    
-    /* Checkbox styling */
-    input[type="checkbox"] {{
-        width: 16px;
-        height: 16px;
-        cursor: pointer;
-        accent-color: #7c3aed;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+        text-align: center;
     }}
     </style>
 """, unsafe_allow_html=True)
 
-# ----------------------------------------------------------------
-# SIDEBAR NAVIGATION
-# ----------------------------------------------------------------
-with st.sidebar:
-    # Warehouse Header
-    st.markdown(f"""
-    <div class="warehouse-header">
-        <div class="warehouse-icon">🏢</div>
-        <div class="warehouse-title">
-            <h2>{t['title']}</h2>
-            <p>{t['subtitle']}</p>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Search Box
-    st.text_input("Search...", placeholder="Search...", label_visibility="collapsed")
-    
-    st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
-    
-    # Navigation Menu
-    st.markdown("**Navigation**")
-    
-    menu_items = [
-        ("📊", t["nav_dash"]),
-        ("📦", t["nav_items"]),
-        ("🔔", t["nav_notifications"]),
-        ("🚚", t["nav_shipments"]),
-        ("📥", t["nav_receiving"]),
-        ("📍", t["nav_zones"]),
-        ("🤝", t["nav_suppliers"]),
-        ("📈", t["nav_reports"]),
-    ]
-    
-    for icon, label in menu_items:
-        if st.button(f"{icon} {label}", key=label, use_container_width=True):
-            st.session_state.current_page = label
-    
-    st.markdown("<div style='margin: 20px 0; border-top: 1px solid #e2e8f0;'></div>", unsafe_allow_html=True)
-    st.markdown(f"**{t['nav_dispatch']}**")
-    st.button(f"📻 {t['nav_driver_radio']}", key=t["nav_driver_radio"], use_container_width=True)
-    st.button(f"📋 {t['nav_manifests']}", key=t["nav_manifests"], use_container_width=True)
-    
-    st.markdown("<div style='margin: 20px 0; border-top: 1px solid #e2e8f0;'></div>", unsafe_allow_html=True)
-    st.markdown(f"**{t['nav_pinned']}**")
-    st.button(f"🗺️ #RTE-19 East Coast Express...", key="route1", use_container_width=True)
-    st.button(f"🗺️ #RTE-42 Local Restock Run...", key="route2", use_container_width=True)
-    st.button(f"+ {t['nav_add_route']}", key="add_route", use_container_width=True)
-    
-    st.markdown("<div style='margin: 20px 0; border-top: 1px solid #e2e8f0;'></div>", unsafe_allow_html=True)
-    st.button(f"❓ {t['nav_help']}", key=t["nav_help"], use_container_width=True)
-    
-    # Language Switcher
-    st.markdown("<div style='position: fixed; bottom: 20px; left: 20px; right: 20px;'>", unsafe_allow_html=True)
-    if st.button(t["lang_btn"], key="lang_switch", use_container_width=True):
+top_col1, top_col2 = st.columns([8, 2])
+with top_col2:
+    if st.button(t["lang_btn"]):
         st.session_state.lang = 'en' if st.session_state.lang == 'ar' else 'ar'
         st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
+
+with top_col1:
+    st.markdown(f"## 🏢 {t['title']}")
+
+st.markdown("---")
+
+selected_tab = st.radio(
+    "Navigation",
+    [t["nav_dash"], t["nav_items"], t["nav_docs"], t["nav_ledger"], t["nav_audit"]],
+    horizontal=True,
+    label_visibility="collapsed"
+)
+
+st.markdown("---")
 
 # ----------------------------------------------------------------
-# MAIN CONTENT AREA
+# TAB 1: DASHBOARD
 # ----------------------------------------------------------------
-# Page Title and Actions
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.markdown(f"<h1 class='page-title'>{t['nav_shipments']}</h1>", unsafe_allow_html=True)
+if selected_tab == t["nav_dash"]:
+    df_stock = stock_overview()
+    total_items_count = len(df_stock)
+    total_qty_sum = df_stock["qty"].sum() if not df_stock.empty else 0.0
+    low_stock_count = len(df_stock[df_stock["status"] == "low"]) if not df_stock.empty else 0
 
-with col2:
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.button(f"📷 {t['scan_barcode']}", key="scan", use_container_width=True)
-    with col_b:
-        st.button(f"{t['new_shipment']}", key="new_ship", type="primary", use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    with c1: st.markdown(f"""<div class="metric-card"><h3>{total_items_count}</h3><p>{t['total_items']}</p></div>""", unsafe_allow_html=True)
+    with c2: st.markdown(f"""<div class="metric-card"><h3>{total_qty_sum:,.2f}</h3><p>{t['total_qty']}</p></div>""", unsafe_allow_html=True)
+    with c3: st.markdown(f"""<div class="metric-card" style="background-color: #7f1d1d;"><h3>{low_stock_count}</h3><p>{t['low_stock']}</p></div>""", unsafe_allow_html=True)
 
-st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
+    st.markdown(f"### 📦 {t['current_stock_title']}")
+    if not df_stock.empty:
+        st.dataframe(df_stock[["code", "name", "category", "unit", "min_stock", "cost", "qty", "value", "status"]], use_container_width=True)
+    else:
+        st.info(t["no_items"])
 
-# Statistics Cards
-stats_data = {
-    t["pending_inbound"]: {"value": 42, "trend": "+18%", "up": True},
-    t["processing"]: {"value": 128, "trend": "+12%", "up": True},
-    t["awaiting_pickup"]: {"value": 36, "trend": "-4%", "up": False},
-    t["completed"]: {"value": 892, "trend": "+22%", "up": True},
-    t["delayed"]: {"value": 8, "trend": "+5%", "up": True},
-}
+# ----------------------------------------------------------------
+# TAB 2: MASTER DATA MANAGEMENT
+# ----------------------------------------------------------------
+elif selected_tab == t["nav_items"]:
+    st.subheader("🏷️ Item Master Data / إضافة وتعريف أصناف جديدة")
+    with st.form("add_item_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1: code = st.text_input("Item Code / كود الصنف *")
+        with c2: name = st.text_input("Item Name / اسم الصنف *")
+        with c3: category = st.text_input("Category / التصنيف")
+        
+        c4, c5, c6 = st.columns(3)
+        with c4: unit = st.text_input("Unit / الوحدة", value="Pcs")
+        with c5: min_stock = st.number_input("Min Stock Limit / حد الأمان", min_value=0.0, value=10.0)
+        with c6: cost = st.number_input("Standard Cost / التكلفة القياسية", min_value=0.0, value=0.0)
+        
+        notes = st.text_input("Notes / ملاحظات")
+        submit_item = st.form_submit_button("Save Item / حفظ الصنف")
+        
+        if submit_item:
+            if code and name and unit:
+                try:
+                    conn = connect()
+                    conn.execute("INSERT INTO items (code, name, category, unit, min_stock, cost, notes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                 (code, name, category, unit, min_stock, cost, notes))
+                    conn.commit()
+                    conn.close()
+                    st.success("Item saved successfully! / تم حفظ الصنف بنجاح!")
+                except sqlite3.IntegrityError:
+                    st.error("Error: Code already exists! / كود الصنف موجود مسبقاً!")
+            else:
+                st.warning("Fill required fields! / برجاء ملء الحقول الإجبارية!")
 
-cols = st.columns(5)
-for idx, (label, data) in enumerate(stats_data.items()):
-    with cols[idx]:
-        trend_class = "trend-up" if data["up"] else "trend-down"
-        trend_icon = "↑" if data["up"] else "↓"
-        st.markdown(f"""
-        <div class="stat-card">
-            <div class="stat-label">{label}</div>
-            <div class="stat-value">{data['value']}</div>
-            <span class="stat-trend {trend_class}">{trend_icon} {data['trend']}</span>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown("---")
+    st.dataframe(items_df(active_only=False), use_container_width=True)
 
-st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
-
-# Filter Bar
-st.markdown(f"""
-<div class="filter-bar">
-    <select class="filter-select">
-        <option>{t['last_7_days']}</option>
-        <option>Last 30 Days</option>
-        <option>This Month</option>
-    </select>
-    <select class="filter-select">
-        <option>{t['daily']}</option>
-        <option>Weekly</option>
-        <option>Monthly</option>
-    </select>
-    <div style="flex: 1;"></div>
-    <select class="filter-select">
-        <option>{t['priority_filter']}</option>
-        <option>Urgent</option>
-        <option>High</option>
-        <option>Medium</option>
-    </select>
-    <select class="filter-select">
-        <option>{t['last_7_days']}</option>
-    </select>
-    <select class="filter-select">
-        <option>{t['daily']}</option>
-    </select>
-</div>
-""", unsafe_allow_html=True)
-
-# AI Notification Banner
-st.markdown(f"""
-<div class="notification-banner">
-    <div class="notification-content">
-        <span>🤖</span>
-        <span>{t['ai_notification']}</span>
-    </div>
-    <div class="notification-actions">
-        <button class="notification-btn">{t['dismiss']}</button>
-        <button class="notification-btn">{t['view_log']}</button>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-# Sample Shipments Data
-shipments_data = [
-    {"id": "#SHP-842", "desc": "Pallet of Electronics (45 units)", "location": "Zone A - Dock 4", "type": t["outbound"], "priority": t["urgent"], "carrier": "FedEx Freight", "contact": "dispatch@fedex.com"},
-    {"id": "#SHP-841", "desc": "Medical Supplies Restock", "location": "Cold Storage B", "type": t["inbound"], "priority": t["urgent"], "carrier": "DHL Express", "contact": "med@dhl.com"},
-    {"id": "#SHP-840", "desc": "Office Furniture (200 lbs)", "location": "Receiving Bay 2", "type": t["inbound"], "priority": t["high"], "carrier": "UPS Supply", "contact": "freight@ups.com"},
-    {"id": "#SHP-839", "desc": "Seasonal Clothing Apparel", "location": "Zone C - Aisle 12", "type": t["outbound"], "priority": t["medium"], "carrier": "XPO Logistics", "contact": "routing@xpo.co"},
-    {"id": "#SHP-838", "desc": "Warehouse Racking Equipment", "location": "Staging Area", "type": t["transfer"], "priority": t["medium"], "carrier": "Internal Fleet", "contact": "fleet@warehouse.org"},
-    {"id": "#SHP-837", "desc": "Defective Parts Return", "location": "QA Hold Area", "type": t["return"], "priority": t["medium"], "carrier": "USPS Commercial", "contact": "returns@usps.gov"},
-    {"id": "#SHP-836", "desc": "Automotive Parts Bulk", "location": "Zone B - Dock 1", "type": t["outbound"], "priority": t["medium"], "carrier": "Old Dominion", "contact": "auto@odfl.com"},
-    {"id": "#SHP-835", "desc": "Packaging Supplies", "location": "Supply Closet A", "type": t["inbound"], "priority": t["medium"], "carrier": "Uline Trcks", "contact": "delivery@uline.com"},
-]
-
-# Priority badge mapping
-priority_map = {
-    t["urgent"]: "badge-urgent",
-    t["high"]: "badge-high",
-    t["medium"]: "badge-medium",
-    t["low"]: "badge-low"
-}
-
-# Type icon mapping
-type_icons = {
-    t["outbound"]: "📤",
-    t["inbound"]: "📥",
-    t["transfer"]: "⇄",
-    t["return"]: "↩"
-}
-
-# Carrier colors
-carrier_colors = {
-    "FedEx Freight": "#4b3621",
-    "DHL Express": "#d40511",
-    "UPS Supply": "#b38b00",
-    "XPO Logistics": "#005eb8",
-    "Internal Fleet": "#64748b",
-    "USPS Commercial": "#333366",
-    "Old Dominion": "#e31837",
-    "Uline Trcks": "#003366",
-    "Sysco Logistics": "#009639",
-    "Safety Transport": "#ff6b35"
-}
-
-# Build HTML Table
-table_html = """
-<table class="modern-table">
-    <thead>
-        <tr>
-            <th><input type="checkbox"></th>
-            <th>""" + t["shipment_id"] + """</th>
-            <th>""" + t["description"] + """</th>
-            <th>""" + t["location"] + """</th>
-            <th>""" + t["type"] + """</th>
-            <th>""" + t["priority"] + """</th>
-            <th>""" + t["carrier"] + """</th>
-            <th>""" + t["contact"] + """</th>
-        </tr>
-    </thead>
-    <tbody>
-"""
-
-for shipment in shipments_data:
-    priority_class = priority_map.get(shipment["priority"], "badge-medium")
-    type_icon = type_icons.get(shipment["type"], "📦")
-    carrier_initial = shipment["carrier"][0]
-    carrier_color = carrier_colors.get(shipment["carrier"], "#64748b")
+# ----------------------------------------------------------------
+# TAB 3: DOCUMENT WORKFLOWS
+# ----------------------------------------------------------------
+elif selected_tab == t["nav_docs"]:
+    st.subheader("🔄 Document Workflows (Inbound / Outbound / Transfer)")
     
-    table_html += f"""
-        <tr>
-            <td><input type="checkbox"></td>
-            <td style="font-weight: 600;">{shipment["id"]}</td>
-            <td>{shipment["desc"]}</td>
-            <td>{shipment["location"]}</td>
-            <td><span class="type-icon type-{shipment["type"].lower()}">{type_icon} {shipment["type"]}</span></td>
-            <td><span class="badge {priority_class}">{shipment["priority"]}</span></td>
-            <td>
-                <div class="carrier-badge">
-                    <div class="carrier-icon" style="background-color: {carrier_color};">{carrier_initial}</div>
-                    {shipment["carrier"]}
-                </div>
-            </td>
-            <td style="color: #64748b; font-size: 13px;">{shipment["contact"]}</td>
-        </tr>
-    """
+    df_items = items_df()
+    df_wh = warehouses_df()
+    df_part = partners_df()
+    
+    if df_items.empty or df_wh.empty:
+        st.warning("Please define items and warehouses first!")
+    else:
+        with st.form("doc_workflow_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1: doc_type = st.selectbox("Document Type / نوع المستند", ["IN", "OUT", "RETURN_IN", "RETURN_OUT", "TRANSFER"])
+            with c2: doc_date = st.date_input("Date / التاريخ", value=date.today())
+            with c3: doc_no = st.text_input("Doc No / رقم المستند (تلقائي إن ترك فارغاً)")
+            
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                wh_id = st.selectbox("From Warehouse / من مخزن", df_wh['id'].tolist(), format_func=lambda x: df_wh[df_wh['id']==x]['name'].values[0])
+            with c5:
+                to_wh_id = st.selectbox("To Warehouse (Transfer only) / إلى مخزن", [None] + df_wh['id'].tolist(), format_func=lambda x: "None" if x is None else df_wh[df_wh['id']==x]['name'].values[0])
+            with c6:
+                partner_id = st.selectbox("Partner / المورد أو العميل", [None] + df_part['id'].tolist(), format_func=lambda x: "None" if x is None else df_part[df_part['id']==x]['name'].values[0]) if not df_part.empty else None
 
-table_html += """
-    </tbody>
-</table>
-"""
+            reference = st.text_input("Reference / المرجع (رقم الفاتورة أو أمر التشغيل)")
+            notes = st.text_input("Notes / ملاحظات")
+            
+            st.markdown("#### Item Line / بند الحركة")
+            item_id = st.selectbox("Item / الصنف", df_items['id'].tolist(), format_func=lambda x: f"{df_items[df_items['id']==x]['code'].values[0]} - {df_items[df_items['id']==x]['name'].values[0]}")
+            qty = st.number_input("Quantity / الكمية", min_value=0.01, value=1.0)
+            unit_cost = st.number_input("Unit Cost / سعر الوحدة", min_value=0.0, value=0.0)
+            batch_no = st.text_input("Batch No / رقم التشغيلة")
+            
+            submit_doc = st.form_submit_button("Post Document / اعتماد المستند")
+            
+            if submit_doc:
+                try:
+                    lines = [{"item_id": item_id, "qty": qty, "unit_cost": unit_cost, "batch_no": batch_no}]
+                    d_id, d_no = create_document(doc_type, doc_date, wh_id, lines, to_warehouse_id=to_wh_id, partner_id=partner_id, reference=reference, notes=notes, doc_no=doc_no)
+                    st.success(f"Document {d_no} posted successfully!")
+                except AppError as e:
+                    st.error(f"Error: {e.key}")
+                except Exception as e:
+                    st.error(f"System Error: {e}")
 
-st.markdown(table_html, unsafe_allow_html=True)
+# ----------------------------------------------------------------
+# TAB 4: MASTER LEDGER LOG & EXPORT
+# ----------------------------------------------------------------
+elif selected_tab == t["nav_ledger"]:
+    st.subheader("📋 Master Ledger Log / سجل الحركات الكلي")
+    df_led = ledger_df()
+    if not df_led.empty:
+        st.dataframe(df_led, use_container_width=True)
+        
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            df_led.to_excel(w, index=False, sheet_name="Ledger")
+            
+        st.download_button(
+            label="📥 Export Ledger to Excel / تصدير السجل لإكسيل",
+            data=buf.getvalue(),
+            file_name=f"rofa_ledger_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("No ledger movements recorded yet.")
 
-# Pagination
-st.markdown(f"""
-<div style="display: flex; justify-content: space-between; align-items: center; margin-top: 20px; padding: 0 16px; color: #64748b; font-size: 13px;">
-    <div>{t['page']} <strong>1</strong> {t['of']} <strong>13</strong></div>
-    <div style="display: flex; align-items: center; gap: 12px;">
-        <span>{t['rows_per_page']}</span>
-        <select class="filter-select" style="padding: 6px 12px;">
-            <option>10</option>
-            <option>25</option>
-            <option>50</option>
-        </select>
-        <div style="display: flex; gap: 4px;">
-            <button class="filter-select" style="padding: 6px 12px;" disabled>&lt;</button>
-            <button class="filter-select" style="padding: 6px 12px;">&gt;</button>
-        </div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+# ----------------------------------------------------------------
+# TAB 5: AUDIT & RECONCILIATION
+# ----------------------------------------------------------------
+elif selected_tab == t["nav_audit"]:
+    st.subheader("⚖️ Inventory Audit & Reconciliation / الجرد والتسوية المخزنية")
+    df_wh = warehouses_df()
+    
+    if not df_wh.empty:
+        selected_wh = st.selectbox("Select Warehouse for Audit / اختر المخزن للجرد", df_wh['id'].tolist(), format_func=lambda x: df_wh[df_wh['id']==x]['name'].values[0])
+        df_stock = stock_overview(warehouse_id=selected_wh)
+        
+        if not df_stock.empty:
+            with st.form("audit_form"):
+                counts = []
+                for _, row in df_stock.iterrows():
+                    c1, c2, c3 = st.columns([3, 2, 2])
+                    with c1: st.write(f"**{row['code']} - {row['name']}**")
+                    with c2: st.write(f"Book: {row['qty']} {row['unit']}")
+                    with c3:
+                        phys = st.number_input(f"Physical Qty", min_value=0.0, value=float(row['qty']), key=f"aud_{row['id']}")
+                        counts.append((row['id'], phys))
+                
+                notes = st.text_input("Audit Notes / ملاحظات لجنة الجرد")
+                submit_audit = st.form_submit_button("Process Reconciliation / اعتماد وتسوية الفروق")
+                
+                if submit_audit:
+                    try:
+                        no, count = create_adjustment(selected_wh, counts, notes=notes)
+                        if no:
+                            st.success(f"Audit document {no} generated with {count} adjustments!")
+                        else:
+                            st.info("No stock differences found.")
+                    except Exception as e:
+                        st.error(f"Audit Error: {e}")
