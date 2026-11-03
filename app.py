@@ -300,7 +300,7 @@ LANG = {
         "nav_help": "Help Center",
         "total_items": "Total Items",
         "total_qty": "Total Stock Qty",
-        "low_stock": "Min Stock Alert ⚠️",
+        "low_stock": "Min Stock Alert ️",
         "current_stock_title": "Current Inventory Status",
         "no_items": "No items recorded yet.",
         "lang_btn": "English 🇺🇸",
@@ -400,7 +400,7 @@ t = LANG[st.session_state.lang]
 is_ar = st.session_state.lang == 'ar'
 direction = "rtl" if is_ar else "ltr"
 
-# Modern UI Styling - Matching the Design
+# Modern UI Styling - LIGHT BACKGROUND THEME
 st.markdown(f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -409,18 +409,24 @@ st.markdown(f"""
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     }}
     
+    /* Main Background - LIGHT THEME */
+    .main {{
+        background-color: #f8fafc;
+    }}
+    
     .main > div {{
+        background-color: #f8fafc;
         padding-top: 2rem;
     }}
     
     /* Sidebar Styling */
     [data-testid="stSidebar"] {{
-        background-color: #f8fafc;
+        background-color: #ffffff;
         border-right: 1px solid #e2e8f0;
     }}
     
     [data-testid="stSidebar"] .css-1d391kg {{
-        background-color: #f8fafc;
+        background-color: #ffffff;
     }}
     
     /* Header Section */
@@ -431,6 +437,7 @@ st.markdown(f"""
         padding: 20px 24px;
         border-bottom: 1px solid #e2e8f0;
         margin-bottom: 20px;
+        background-color: #ffffff;
     }}
     
     .warehouse-icon {{
@@ -605,6 +612,7 @@ st.markdown(f"""
         border-bottom: 1px solid #f1f5f9;
         font-size: 14px;
         color: #334155;
+        background-color: white;
     }}
     
     .modern-table tr:hover td {{
@@ -760,6 +768,17 @@ st.markdown(f"""
     ::-webkit-scrollbar-thumb:hover {{
         background: #94a3b8;
     }}
+    
+    /* Code Block Styling - Light Theme */
+    code, pre {{
+        background-color: #f1f5f9 !important;
+        color: #334155 !important;
+    }}
+    
+    /* Streamlit Containers */
+    .stMarkdown, .stDataFrame {{
+        background-color: transparent;
+    }}
     </style>
 """, unsafe_allow_html=True)
 
@@ -787,12 +806,12 @@ with st.sidebar:
     st.markdown("**Navigation**")
     
     menu_items = [
-        ("📊", t["nav_dash"]),
-        ("📦", t["nav_items"]),
-        ("🔔", t["nav_notifications"]),
-        ("🚚", t["nav_shipments"]),
+        ("", t["nav_dash"]),
+        ("", t["nav_items"]),
+        ("", t["nav_notifications"]),
+        ("", t["nav_shipments"]),
         ("📥", t["nav_receiving"]),
-        ("", t["nav_zones"]),
+        ("📍", t["nav_zones"]),
         ("🤝", t["nav_suppliers"]),
         ("📈", t["nav_reports"]),
     ]
@@ -808,7 +827,7 @@ with st.sidebar:
     
     st.markdown("<div style='margin: 20px 0; border-top: 1px solid #e2e8f0;'></div>", unsafe_allow_html=True)
     st.markdown(f"**{t['nav_pinned']}**")
-    st.button(f"️ #RTE-19 East Coast Express...", key="route1", use_container_width=True)
+    st.button(f"🗺️ #RTE-19 East Coast Express...", key="route1", use_container_width=True)
     st.button(f"🗺️ #RTE-42 Local Restock Run...", key="route2", use_container_width=True)
     st.button(f"+ {t['nav_add_route']}", key="add_route", use_container_width=True)
     
@@ -928,9 +947,9 @@ priority_map = {
 
 # Type icon mapping
 type_icons = {
-    t["outbound"]: "",
-    t["inbound"]: "",
-    t["transfer"]: "",
+    t["outbound"]: "📤",
+    t["inbound"]: "📥",
+    t["transfer"]: "⇄",
     t["return"]: "↩"
 }
 
