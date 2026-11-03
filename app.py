@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 # ==============================================================================
-# BACKEND: قاعدة البيانات وقواعد العمل
+# BACKEND
 # ==============================================================================
 DB_FILE = os.environ.get("ROFA_DB", "rofa_warehouse_v2.db")
 
@@ -37,7 +37,10 @@ def q(sql, params=()):
         st.error(f"خطأ في قاعدة البيانات: {str(e)}")
         return pd.DataFrame()
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except:
+            pass
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS warehouses(
@@ -110,7 +113,7 @@ CREATE INDEX IF NOT EXISTS ix_docs_date ON documents(date);
 """
 
 def init_db():
-    """تأكد من إنشاء قاعدة البيانات بشكل صحيح"""
+    """تأكد من إنشاء قاعدة البيانات وإضافة الأعمدة المفقودة"""
     try:
         conn = connect()
         conn.executescript(SCHEMA)
@@ -118,6 +121,14 @@ def init_db():
         # تأكد من وجود المخزن الرئيسي
         if conn.execute("SELECT COUNT(*) FROM warehouses").fetchone()[0] == 0:
             conn.execute("INSERT INTO warehouses(code, name, location) VALUES ('MAIN', 'المخزن الرئيسي', '')")
+            conn.commit()
+        
+        # تحقق من وجود عمود weight في جدول items
+        columns = conn.execute("PRAGMA table_info(items)").fetchall()
+        column_names = [col[1] for col in columns]
+        
+        if 'weight' not in column_names:
+            conn.execute("ALTER TABLE items ADD COLUMN weight REAL DEFAULT 0")
             conn.commit()
         
         conn.close()
@@ -131,7 +142,6 @@ def items_df(active_only=True):
             sql += " WHERE active=1"
         return q(sql + " ORDER BY code")
     except Exception as e:
-        st.error(f"خطأ في جلب الأصناف: {str(e)}")
         return pd.DataFrame(columns=['id', 'code', 'name', 'category', 'unit', 'min_stock', 'cost', 'price', 'weight', 'active', 'notes'])
 
 def warehouses_df(active_only=True):
@@ -268,7 +278,6 @@ def ledger_df():
                 ORDER BY l.date DESC, l.id DESC""")
 
 def update_item_in_db(item_id, field, value):
-    """تحديث حقل معين في جدول الأصناف"""
     try:
         conn = connect()
         conn.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, item_id))
@@ -276,14 +285,11 @@ def update_item_in_db(item_id, field, value):
         conn.close()
         return True
     except Exception as e:
-        st.error(f"خطأ في التحديث: {str(e)}")
         return False
 
 def add_product_to_inventory(code, name, category, unit, qty, weight, cost, price, min_stock, notes=""):
-    """إضافة منتج جديد للمخزون مع الكمية والوزن"""
     conn = connect()
     try:
-        # إضافة الصنف
         conn.execute("""INSERT INTO items(code, name, category, unit, min_stock, cost, price, weight, notes) 
                        VALUES (?,?,?,?,?,?,?,?,?)""", 
                     (code, name, category, unit, min_stock, cost, price, weight, notes))
@@ -291,23 +297,19 @@ def add_product_to_inventory(code, name, category, unit, qty, weight, cost, pric
         
         item_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         
-        # إذا كانت هناك كمية، أضفها للمخزن
         if qty > 0:
             wh_id = conn.execute("SELECT id FROM warehouses WHERE code='MAIN'").fetchone()[0]
             today = date.today().isoformat()
             doc_no = next_doc_no(conn, "IN")
             
-            # إنشاء مستند وارد
             cur = conn.execute("""INSERT INTO documents(doc_no, type, date, warehouse_id, status, created_at)
                                  VALUES (?, 'IN', ?, ?, 'Approved', ?)""",
                              (doc_no, today, wh_id, datetime.now().isoformat(timespec="seconds")))
             doc_id = cur.lastrowid
             
-            # إضافة بند للمستند
             conn.execute("""INSERT INTO document_lines(document_id, item_id, qty, unit_cost) 
                            VALUES (?,?,?,?)""", (doc_id, item_id, qty, cost))
             
-            # إضافة للحركة
             conn.execute("""INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) 
                            VALUES (?,?,?,?,?,?)""", (doc_id, item_id, wh_id, qty, 0, today))
         
@@ -322,14 +324,14 @@ def add_product_to_inventory(code, name, category, unit, qty, weight, cost, pric
         conn.close()
 
 # ==============================================================================
-# FRONTEND: واجهة المستخدم
+# FRONTEND
 # ==============================================================================
 st.set_page_config(page_title="نظام Rofa للمخازن", page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
 
 # تهيئة قاعدة البيانات
 init_db()
 
-# CSS Styling
+# CSS
 st.markdown("""
 <style>
     .stApp, .main .block-container {
@@ -344,31 +346,6 @@ st.markdown("""
         border-radius: 12px;
         margin-bottom: 24px;
         box-shadow: 0 4px 6px rgba(30, 58, 138, 0.2);
-    }
-    
-    .nav-button {
-        flex: 1;
-        background-color: #1e40af;
-        color: white !important;
-        padding: 14px 24px;
-        border-radius: 8px;
-        text-align: center;
-        cursor: pointer;
-        font-weight: 600;
-        font-size: 15px;
-        transition: all 0.3s;
-        border: 2px solid transparent;
-    }
-    
-    .nav-button:hover {
-        background-color: #3b82f6;
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
-    }
-    
-    .nav-button.active {
-        background-color: #60a5fa;
-        border-color: #93c5fd;
     }
     
     .stButton > button {
@@ -421,11 +398,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Navigation State
+# Navigation
 if 'current_page' not in st.session_state:
     st.session_state.current_page = "dashboard"
 
-# Navigation Bar
 nav_pages = {
     "dashboard": "📊 لوحة التحكم",
     "inventory": "📦 المخزون والمنتجات",
@@ -438,7 +414,6 @@ st.markdown('<div class="nav-container">', unsafe_allow_html=True)
 cols = st.columns(len(nav_pages))
 for idx, (page_key, page_name) in enumerate(nav_pages.items()):
     with cols[idx]:
-        is_active = st.session_state.current_page == page_key
         if st.button(page_name, key=f"nav_{page_key}", use_container_width=True):
             st.session_state.current_page = page_key
             st.rerun()
@@ -480,7 +455,7 @@ if st.session_state.current_page == "dashboard":
                 <div class="stat-value" style="color: #dc2626;">{low_stock_count}</div>
             </div>""", unsafe_allow_html=True)
 
-        st.markdown('<div class="section-header">️ الأصناف التي وصلت لحد الأمان</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">⚠️ الأصناف التي وصلت لحد الأمان</div>', unsafe_allow_html=True)
         if not df_stock.empty:
             low_items = df_stock[df_stock["status"] == "low"][["code", "name", "category", "qty", "min_stock", "unit"]]
             if not low_items.empty:
@@ -490,7 +465,7 @@ if st.session_state.current_page == "dashboard":
         else:
             st.info("📭 لا توجد أصناف مسجلة حتى الآن.")
 
-        st.markdown('<div class="section-header"> آخر المستندات</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">📄 آخر المستندات</div>', unsafe_allow_html=True)
         recent_docs = documents_df()
         if not recent_docs.empty:
             st.dataframe(recent_docs.head(5), use_container_width=True, hide_index=True)
@@ -507,7 +482,6 @@ elif st.session_state.current_page == "inventory":
         
         if not df_items.empty:
             st.markdown("### 📋 جدول المنتجات (قابل للتعديل)")
-            st.markdown("يمكنك التعديل مباشرة في الجدول ثم الضغط على حفظ التغييرات")
             
             edited_df = st.data_editor(
                 df_items[['id', 'code', 'name', 'category', 'unit', 'min_stock', 'cost', 'price', 'weight', 'notes']],
@@ -528,7 +502,7 @@ elif st.session_state.current_page == "inventory":
                 num_rows="dynamic"
             )
             
-            if st.button(" حفظ التغييرات", type="primary", use_container_width=True):
+            if st.button("💾 حفظ التغييرات", type="primary", use_container_width=True):
                 for index, row in edited_df.iterrows():
                     if index < len(df_items):
                         orig_row = df_items.iloc[index]
@@ -693,7 +667,7 @@ elif st.session_state.current_page == "documents":
                         st.session_state.doc_lines = []
                         st.rerun()
                     except AppError as e:
-                        st.error(f" خطأ في البيانات: {str(e)}")
+                        st.error(f"❌ خطأ في البيانات: {str(e)}")
                     except Exception as e:
                         st.error(f"❌ خطأ في النظام: {str(e)}")
 
