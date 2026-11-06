@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 # ==============================================================================
-# BACKEND - نظام مخزن الخامات (ROFA System)
+# BACKEND - نظام إدارة المخازن (ROFA System)
 # ==============================================================================
 DB_FILE = os.environ.get("ROFA_DB", "rofa_raw_materials.db")
 
@@ -155,7 +155,7 @@ def add_movement(
             if current_balance < qty:
                 return (
                     False,
-                    f"الرصيد غير كافٍ للصرف! المتاح حالياً: {current_balance:.2f}، المطلوبة: {qty}",
+                    f"الرصيد غير كافٍ للصرف! المتاح: {current_balance:,.2f}، المطلوبة: {qty}",
                 )
 
         conn.execute(
@@ -181,21 +181,8 @@ def add_movement(
         conn.close()
 
 
-def update_material(item_id, field, value):
-    try:
-        conn = connect()
-        conn.execute(
-            f"UPDATE raw_materials SET {field}=? WHERE id=?", (value, item_id)
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception:
-        return False
-
-
 # ==============================================================================
-# FRONTEND - الواجهة التفاعلية (Streamlit UI)
+# FRONTEND - الواجهة الاحترافية (Modern Dark Executive UI)
 # ==============================================================================
 st.set_page_config(
     page_title="نظام ROFA لإدارة المخازن",
@@ -211,37 +198,49 @@ logo_html = ""
 if os.path.exists(LOGO_PATH):
     with open(LOGO_PATH, "rb") as f:
         logo_b64 = base64.b64encode(f.read()).decode()
-    logo_html = f'<img src="data:image/png;base64,{logo_b64}" style="height: 70px; margin-left: 20px;">'
+    logo_html = f'<img src="data:image/png;base64,{logo_b64}" style="height: 60px; margin-left: 15px;">'
 
 st.markdown(
     """
 <style>
-    .stApp, .main .block-container { background-color: #f8fafc !important; }
+    /* خلفية داكنة فخمة ومريحة للعين */
+    .stApp, .main .block-container { background-color: #0f172a !important; color: #f8fafc !important; }
+    
+    /* الهيدر العلوي */
     .header-container {
         display: flex; align-items: center; justify-content: flex-start;
-        padding: 18px 24px; background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
-        border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(30, 58, 138, 0.25);
+        padding: 16px 24px; background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+        border: 1px solid #334155; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
     }
-    .header-title { font-size: 26px; font-weight: 700; color: white; margin: 0; }
-    .header-subtitle { font-size: 14px; color: #dbeafe; margin: 4px 0 0 0; }
+    .header-title { font-size: 24px; font-weight: 750; color: #ffffff; margin: 0; }
+    .header-subtitle { font-size: 13px; color: #94a3b8; margin: 4px 0 0 0; }
+    
+    /* شريط التنقل العلوي */
     .nav-container {
-        display: flex; gap: 10px; padding: 12px; background-color: #1e3a8a;
-        border-radius: 12px; margin-bottom: 24px; box-shadow: 0 4px 6px rgba(30, 58, 138, 0.15);
+        display: flex; gap: 10px; padding: 10px; background-color: #1e293b;
+        border: 1px solid #334155; border-radius: 12px; margin-bottom: 24px; box-shadow: 0 4px 6px rgba(0,0,0,0.2);
     }
+    
+    /* تخصيص الحقول والنصوص */
     .stTextInput > div > div > input, .stNumberInput > div > div > input, .stSelectbox > div > div > div, .stTextArea > div > div > textarea {
-        background-color: #ffffff !important; color: #0f172a !important; border: 1px solid #cbd5e1 !important; font-weight: 500;
+        background-color: #1e293b !important; color: #f8fafc !important; border: 1px solid #475569 !important; font-weight: 500;
     }
     label, .stTextInput label, .stNumberInput label, .stSelectbox label, .stTextArea label {
-        color: #1e3a8a !important; font-weight: 600 !important; font-size: 14px !important;
+        color: #cbd5e1 !important; font-weight: 600 !important; font-size: 14px !important;
     }
-    .stButton > button { background-color: #1e40af !important; color: white !important; border: none !important; font-weight: 600; padding: 10px 24px; border-radius: 8px; }
-    .stButton > button:hover { background-color: #2563eb !important; }
-    .stat-card { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-align: center; border-right: 5px solid #1e40af; }
-    .stat-value { font-size: 28px; font-weight: 700; color: #1e40af; margin: 8px 0; }
-    .stat-label { font-size: 14px; color: #64748b; font-weight: 600; }
+    
+    /* الأزرار التفاعلية */
+    .stButton > button { background-color: #2563eb !important; color: white !important; border: none !important; font-weight: 600; padding: 10px 24px; border-radius: 8px; }
+    .stButton > button:hover { background-color: #1d4ed8 !important; }
+    
+    /* بطاقات الإحصائيات الفخمة */
+    .stat-card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; border-right: 5px solid #3b82f6; }
+    .stat-value { font-size: 28px; font-weight: 700; color: #60a5fa; margin: 8px 0; }
+    .stat-label { font-size: 14px; color: #94a3b8; font-weight: 600; }
+    
     #MainMenu, footer, header {visibility: hidden;}
-    .section-header { background-color: #1e3a8a; color: white; padding: 12px 20px; border-radius: 8px; margin: 20px 0 16px 0; font-size: 18px; font-weight: 700; }
-    .form-container { background: white; padding: 24px; border-radius: 12px; border: 1px solid #e2e8f0; margin: 16px 0; }
+    .section-header { background-color: #1e293b; border: 1px solid #334155; color: white; padding: 12px 20px; border-radius: 8px; margin: 20px 0 16px 0; font-size: 18px; font-weight: 700; }
+    .form-container { background: #1e293b; border: 1px solid #334155; padding: 24px; border-radius: 12px; margin: 16px 0; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -253,10 +252,10 @@ if "current_page" not in st.session_state:
 st.markdown(
     f"""
 <div class="header-container">
-    {logo_html if logo_html else '<div style="width: 60px; height: 60px; background: white; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-left: 20px; font-size: 30px;">📦</div>'}
+    {logo_html if logo_html else '<div style="width: 55px; height: 55px; background: #3b82f6; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-left: 15px; font-size: 26px;">📦</div>'}
     <div>
-        <h1 class="header-title">نظام ROFA المتكامل لإدارة المخازن</h1>
-        <p class="header-subtitle">إدارة الخامات والمنتجات - الرصيد الافتتاحي، الوارد، المنصرف والمتبقي الفعلي</p>
+        <h1 class="header-title">نظام ROFA لإدارة المخازن</h1>
+        <p class="header-subtitle">لوحة التحكم الاحترافية - مراقبة الوارد والمنصرف والأرصدة اللحظية</p>
     </div>
 </div>
 """,
@@ -282,7 +281,7 @@ for idx, (page_key, page_name) in enumerate(nav_pages.items()):
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ------------------------------------------------------------------------------
-# PAGE 1: لوحة الأرصدة الرئيسية
+# PAGE 1: مخزن الخام (الرئيسية)
 # ------------------------------------------------------------------------------
 if st.session_state.current_page == "raw_materials":
     st.markdown(
@@ -331,17 +330,17 @@ if st.session_state.current_page == "raw_materials":
                 )
             with c3:
                 st.markdown(
-                    f'<div class="stat-card"><div class="stat-label">إجمالي عدد الشكاير</div><div class="stat-value">{total_bags:,.1f}</div></div>',
+                    f'<div class="stat-card"><div class="stat-label">إجمالي الشكاير</div><div class="stat-value">{total_bags:,.1f}</div></div>',
                     unsafe_allow_html=True,
                 )
             with c4:
                 st.markdown(
-                    '<div class="stat-card"><div class="stat-label">حالة النظام</div><div class="stat-value" style="color: #166534;">محدث تلقائياً</div></div>',
+                    '<div class="stat-card"><div class="stat-label">حالة النظام</div><div class="stat-value" style="color: #4ade80;">متصل وآمن</div></div>',
                     unsafe_allow_html=True,
                 )
 
             st.markdown("---")
-            st.markdown("### 📋 جدول أرصدة الخامات والمخزون")
+            st.markdown("### 📋 جدول أرصدة الخامات والمنتجات")
             display_df = df_materials[
                 [
                     "code",
@@ -371,17 +370,17 @@ if st.session_state.current_page == "raw_materials":
             st.dataframe(display_df, use_container_width=True, hide_index=True)
         else:
             st.info(
-                "📭 لا توجد أصناف مسجلة حتى الآن. يمكنك الانتقال لصفحة 'إضافة صنف جديد' للبدء."
+                "📭 لا توجد أصناف مسجلة. توجه إلى قسم 'إضافة صنف جديد' للبدء."
             )
     except Exception as e:
-        st.error(f"خطأ في عرض البيانات: {str(e)}")
+        st.error(f"خطأ: {str(e)}")
 
 # ------------------------------------------------------------------------------
-# PAGE 2: تسجيل الحركات اليومية
+# PAGE 2: حركة الخام
 # ------------------------------------------------------------------------------
 elif st.session_state.current_page == "movements":
     st.markdown(
-        '<div class="section-header">🔄 حركة الخام - تسجيل وتسجيل الحركات اليومية</div>',
+        '<div class="section-header">🔄 حركة الخام - سجل الحركات اليومية</div>',
         unsafe_allow_html=True,
     )
 
@@ -406,7 +405,7 @@ elif st.session_state.current_page == "movements":
                     list(material_options.keys()),
                 )
             else:
-                st.warning("⚠️ لا توجد خامات مسجلة")
+                st.warning("⚠️ يرجى إضافة أصناف أولاً")
                 selected_material = None
 
         c4, c5 = st.columns(2)
@@ -416,29 +415,29 @@ elif st.session_state.current_page == "movements":
             )
         with c5:
             reference = st.text_input(
-                "رقم الإذن / الفاتورة", placeholder="مثال: PO-102"
+                "رقم الإذن / الفاتورة", placeholder="مثال: PO-101"
             )
 
         c6, c7 = st.columns(2)
         with c6:
             party = st.text_input(
-                "الجهة / المورد / الخط", placeholder="مثال: شركة البدر / صالة 1"
+                "الجهة / المورد / الخط", placeholder="مثال: شركة البدر / خط 1"
             )
         with c7:
-            notes = st.text_input("ملاحظات إضافية")
+            notes = st.text_input("ملاحظات")
         st.markdown("</div>", unsafe_allow_html=True)
 
         submitted = st.form_submit_button(
-            "✅ تسجيل الحركة في المخزن",
+            "✅ تسجيل الحركة في السجل",
             type="primary",
             use_container_width=True,
         )
 
         if submitted:
             if selected_material is None:
-                st.error("❌ يجب اختيار خامة مسجلة أولاً")
+                st.error("❌ يجب اختيار خامة مسجلة")
             elif qty <= 0:
-                st.error("❌ يجب كتابة كمية أكبر من 0")
+                st.error("❌ الكمية يجب أن تكون أكبر من صفر")
             else:
                 success, message = add_movement(
                     date=movement_date,
@@ -457,7 +456,7 @@ elif st.session_state.current_page == "movements":
                     )
                     conn.close()
                     st.info(
-                        f"📊 الرصيد الجديد للصنف: **{current_balance:,.2f} كجم**"
+                        f"📊 الرصيد الحالي للصنف: **{current_balance:,.2f} كجم**"
                     )
                 else:
                     st.error(f"❌ {message}")
@@ -517,11 +516,11 @@ elif st.session_state.current_page == "movements":
         )
 
 # ------------------------------------------------------------------------------
-# PAGE 3: إضافة خامة جديدة
+# PAGE 3: إضافة صنف جديد
 # ------------------------------------------------------------------------------
 elif st.session_state.current_page == "add_material":
     st.markdown(
-        '<div class="section-header">➕ إضافة خامة أو منتج جديد للمخزن</div>',
+        '<div class="section-header">➕ إضافة صنف أو خامة جديدة</div>',
         unsafe_allow_html=True,
     )
     with st.form("add_material_form", clear_on_submit=True):
@@ -529,10 +528,10 @@ elif st.session_state.current_page == "add_material":
         c1, c2, c3 = st.columns(3)
         with c1:
             code = st.text_input(
-                "كود الخامة *", placeholder="مثال: 1801 أو 218W"
+                "كود الصنف *", placeholder="مثال: 1801 أو C9"
             )
         with c2:
-            name = st.text_input("اسم الخامة *", placeholder="مثال: لينير ناشف")
+            name = st.text_input("اسم الصنف *", placeholder="مثال: لينير ناشف")
         with c3:
             unit = st.selectbox("الوحدة", ["كجم", "طن", "لتر", "قطعة"])
 
@@ -546,15 +545,15 @@ elif st.session_state.current_page == "add_material":
                 "الرصيد الافتتاحي (كجم)", min_value=0.0, value=0.0, step=0.01
             )
 
-        notes = st.text_area("ملاحظات", placeholder="مواصفات أو بيانات إضافية...")
+        notes = st.text_area("ملاحظات", placeholder="مواصفات إضافية...")
         st.markdown("</div>", unsafe_allow_html=True)
 
         submitted = st.form_submit_button(
-            "✅ إضافة الصنف فوراً", type="primary", use_container_width=True
+            "✅ حفظ وصيغة الصنف", type="primary", use_container_width=True
         )
         if submitted:
             if not code or not name:
-                st.error("❌ يجب كتابة الكود والاسم بشكل صحيح")
+                st.error("❌ يجب إدخال الكود والاسم")
             else:
                 success, message = add_material(
                     code=code,
@@ -570,7 +569,7 @@ elif st.session_state.current_page == "add_material":
                     st.error(f"❌ {message}")
 
 # ------------------------------------------------------------------------------
-# PAGE 4: التقارير والتصدير
+# PAGE 4: التقارير والإحصائيات
 # ------------------------------------------------------------------------------
 elif st.session_state.current_page == "reports":
     st.markdown(
@@ -649,14 +648,14 @@ elif st.session_state.current_page == "reports":
                     writer, index=False, sheet_name="تقرير المخزن"
                 )
             st.download_button(
-                label="📥 تصدير التقرير النهائي إلى Excel",
+                label="📥 تصدير التقرير النهائي إلى إكسيل",
                 data=buf.getvalue(),
                 file_name=f"rofa_report_{date.today().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
         else:
-            st.info("📭 لا توجد بيانات كافية لإصدار التقرير")
+            st.info("📭 لا توجد بيانات كافية لإصدار التقارير")
     except Exception as e:
         st.error(f"خطأ: {str(e)}")
 
