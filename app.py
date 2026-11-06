@@ -651,3 +651,17 @@ elif st.session_state.current_page == "reports":
             st.download_button(
                 label="📥 تصدير التقرير النهائي إلى Excel",
                 data=buf.getvalue(),
+                file_name=f"rofa_report_{date.today().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        else:
+            st.info("📭 لا توجد بيانات كافية لإصدار التقرير")
+    except Exception as e:
+        st.error(f"خطأ: {str(e)}")
+
+st.markdown("---")
+st.markdown(
+    "<div style='text-align: center; color: #64748b; padding: 15px;'><strong>نظام ROFA المطور لإدارة المخازن</strong></div>",
+    unsafe_allow_html=True,
+)
