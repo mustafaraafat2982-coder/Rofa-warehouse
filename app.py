@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 # ==============================================================================
-# BACKEND - نظام مخزن الخامات (ROFA)
+# BACKEND - نظام مخزن الخامات (ROFA System)
 # ==============================================================================
 DB_FILE = os.environ.get("ROFA_DB", "rofa_raw_materials.db")
 
@@ -155,7 +155,7 @@ def add_movement(
             if current_balance < qty:
                 return (
                     False,
-                    f"الرصيد غير كافٍ. المتاح: {current_balance:.2f}، المطلوب: {qty}",
+                    f"الرصيد غير كافٍ للصرف! المتاح حالياً: {current_balance:.2f}، المطلوبة: {qty}",
                 )
 
         conn.execute(
@@ -195,10 +195,10 @@ def update_material(item_id, field, value):
 
 
 # ==============================================================================
-# FRONTEND - واجهة المستخدم Streamlit
+# FRONTEND - الواجهة التفاعلية (Streamlit UI)
 # ==============================================================================
 st.set_page_config(
-    page_title="نظام ROFA لمخزن الخامات",
+    page_title="نظام ROFA لإدارة المخازن",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -216,31 +216,31 @@ if os.path.exists(LOGO_PATH):
 st.markdown(
     """
 <style>
-    .stApp, .main .block-container { background-color: #f5f0e1 !important; }
+    .stApp, .main .block-container { background-color: #f8fafc !important; }
     .header-container {
         display: flex; align-items: center; justify-content: flex-start;
-        padding: 15px 20px; background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
-        border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(30, 58, 138, 0.3);
+        padding: 18px 24px; background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
+        border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(30, 58, 138, 0.25);
     }
     .header-title { font-size: 26px; font-weight: 700; color: white; margin: 0; }
-    .header-subtitle { font-size: 13px; color: #dbeafe; margin: 4px 0 0 0; }
+    .header-subtitle { font-size: 14px; color: #dbeafe; margin: 4px 0 0 0; }
     .nav-container {
         display: flex; gap: 10px; padding: 12px; background-color: #1e3a8a;
-        border-radius: 12px; margin-bottom: 24px; box-shadow: 0 4px 6px rgba(30, 58, 138, 0.2);
+        border-radius: 12px; margin-bottom: 24px; box-shadow: 0 4px 6px rgba(30, 58, 138, 0.15);
     }
     .stTextInput > div > div > input, .stNumberInput > div > div > input, .stSelectbox > div > div > div, .stTextArea > div > div > textarea {
-        background-color: #ffffff !important; color: #1e293b !important; border: 1px solid #cbd5e1 !important; font-weight: 500;
+        background-color: #ffffff !important; color: #0f172a !important; border: 1px solid #cbd5e1 !important; font-weight: 500;
     }
     label, .stTextInput label, .stNumberInput label, .stSelectbox label, .stTextArea label {
         color: #1e3a8a !important; font-weight: 600 !important; font-size: 14px !important;
     }
     .stButton > button { background-color: #1e40af !important; color: white !important; border: none !important; font-weight: 600; padding: 10px 24px; border-radius: 8px; }
-    .stButton > button:hover { background-color: #3b82f6 !important; }
-    .stat-card { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-align: center; border-right: 4px solid #1e40af; }
+    .stButton > button:hover { background-color: #2563eb !important; }
+    .stat-card { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-align: center; border-right: 5px solid #1e40af; }
     .stat-value { font-size: 28px; font-weight: 700; color: #1e40af; margin: 8px 0; }
     .stat-label { font-size: 14px; color: #64748b; font-weight: 600; }
     #MainMenu, footer, header {visibility: hidden;}
-    .section-header { background-color: #1e3a8a; color: white; padding: 12px 20px; border-radius: 8px; margin: 24px 0 16px 0; font-size: 18px; font-weight: 700; }
+    .section-header { background-color: #1e3a8a; color: white; padding: 12px 20px; border-radius: 8px; margin: 20px 0 16px 0; font-size: 18px; font-weight: 700; }
     .form-container { background: white; padding: 24px; border-radius: 12px; border: 1px solid #e2e8f0; margin: 16px 0; }
 </style>
 """,
@@ -253,10 +253,10 @@ if "current_page" not in st.session_state:
 st.markdown(
     f"""
 <div class="header-container">
-    {logo_html if logo_html else '<div style="width: 70px; height: 70px; background: white; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-left: 20px; font-size: 32px;">📦</div>'}
+    {logo_html if logo_html else '<div style="width: 60px; height: 60px; background: white; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-left: 20px; font-size: 30px;">📦</div>'}
     <div>
-        <h1 class="header-title">نظام ROFA لمخزن الخامات</h1>
-        <p class="header-subtitle">إدارة خامات البلاستيك والأنواع المختلفة - الوارد والمنصرف والأرصدة</p>
+        <h1 class="header-title">نظام ROFA المتكامل لإدارة المخازن</h1>
+        <p class="header-subtitle">إدارة الخامات والمنتجات - الرصيد الافتتاحي، الوارد، المنصرف والمتبقي الفعلي</p>
     </div>
 </div>
 """,
@@ -266,8 +266,8 @@ st.markdown(
 nav_pages = {
     "raw_materials": "📦 مخزن الخام (الرئيسية)",
     "movements": "🔄 حركة الخام",
-    "add_material": "➕ إضافة خامة جديدة",
-    "reports": "📊 التقارير",
+    "add_material": "➕ إضافة صنف جديد",
+    "reports": "📊 التقارير والإحصائيات",
 }
 
 st.markdown('<div class="nav-container">', unsafe_allow_html=True)
@@ -282,7 +282,7 @@ for idx, (page_key, page_name) in enumerate(nav_pages.items()):
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ------------------------------------------------------------------------------
-# PAGE 1: مخزن الخام (الرئيسية)
+# PAGE 1: لوحة الأرصدة الرئيسية
 # ------------------------------------------------------------------------------
 if st.session_state.current_page == "raw_materials":
     st.markdown(
@@ -321,7 +321,7 @@ if st.session_state.current_page == "raw_materials":
             c1, c2, c3, c4 = st.columns(4)
             with c1:
                 st.markdown(
-                    f'<div class="stat-card"><div class="stat-label">إجمالي الخامات</div><div class="stat-value">{total_materials}</div></div>',
+                    f'<div class="stat-card"><div class="stat-label">إجمالي الأصناف</div><div class="stat-value">{total_materials}</div></div>',
                     unsafe_allow_html=True,
                 )
             with c2:
@@ -331,17 +331,17 @@ if st.session_state.current_page == "raw_materials":
                 )
             with c3:
                 st.markdown(
-                    f'<div class="stat-card"><div class="stat-label">إجمالي الشكاير</div><div class="stat-value">{total_bags:,.1f}</div></div>',
+                    f'<div class="stat-card"><div class="stat-label">إجمالي عدد الشكاير</div><div class="stat-value">{total_bags:,.1f}</div></div>',
                     unsafe_allow_html=True,
                 )
             with c4:
                 st.markdown(
-                    '<div class="stat-card"><div class="stat-label">حالة النظام</div><div class="stat-value" style="color: #166534;">نشط</div></div>',
+                    '<div class="stat-card"><div class="stat-label">حالة النظام</div><div class="stat-value" style="color: #166534;">محدث تلقائياً</div></div>',
                     unsafe_allow_html=True,
                 )
 
             st.markdown("---")
-            st.markdown("### 📋 جدول أرصدة الخامات")
+            st.markdown("### 📋 جدول أرصدة الخامات والمخزون")
             display_df = df_materials[
                 [
                     "code",
@@ -369,68 +369,19 @@ if st.session_state.current_page == "raw_materials":
                 "ملاحظات",
             ]
             st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-            st.markdown("---")
-            st.markdown("### ✏️ تعديل بيانات الخامات")
-            edited_df = st.data_editor(
-                df_materials[
-                    [
-                        "id",
-                        "code",
-                        "name",
-                        "unit",
-                        "bag_weight",
-                        "opening_balance",
-                        "notes",
-                    ]
-                ],
-                column_config={
-                    "id": st.column_config.NumberColumn("ID", disabled=True),
-                    "code": st.column_config.TextColumn("الكود"),
-                    "name": st.column_config.TextColumn("اسم الخامة"),
-                    "unit": st.column_config.TextColumn("الوحدة"),
-                    "bag_weight": st.column_config.NumberColumn(
-                        "وزن الشكارة (كجم)"
-                    ),
-                    "opening_balance": st.column_config.NumberColumn(
-                        "الرصيد الافتتاحي"
-                    ),
-                    "notes": st.column_config.TextColumn("ملاحظات"),
-                },
-                hide_index=True,
-                use_container_width=True,
-            )
-
-            if st.button(
-                "💾 حفظ التغييرات", type="primary", use_container_width=True
-            ):
-                for index, row in edited_df.iterrows():
-                    orig_row = df_materials.iloc[index]
-                    for col in [
-                        "code",
-                        "name",
-                        "unit",
-                        "bag_weight",
-                        "opening_balance",
-                        "notes",
-                    ]:
-                        if row[col] != orig_row[col]:
-                            update_material(int(row["id"]), col, row[col])
-                st.success("✅ تم حفظ التغييرات بنجاح!")
-                st.rerun()
         else:
             st.info(
-                "📭 لا توجد خامات مسجلة. انتقل إلى صفحة 'إضافة خامة جديدة' للبدء."
+                "📭 لا توجد أصناف مسجلة حتى الآن. يمكنك الانتقال لصفحة 'إضافة صنف جديد' للبدء."
             )
     except Exception as e:
-        st.error(f"خطأ: {str(e)}")
+        st.error(f"خطأ في عرض البيانات: {str(e)}")
 
 # ------------------------------------------------------------------------------
-# PAGE 2: حركة الخام
+# PAGE 2: تسجيل الحركات اليومية
 # ------------------------------------------------------------------------------
 elif st.session_state.current_page == "movements":
     st.markdown(
-        '<div class="section-header">🔄 حركة الخام - سجل الحركات اليومية</div>',
+        '<div class="section-header">🔄 حركة الخام - تسجيل وتسجيل الحركات اليومية</div>',
         unsafe_allow_html=True,
     )
 
@@ -451,10 +402,11 @@ elif st.session_state.current_page == "movements":
                     for _, row in materials_list.iterrows()
                 }
                 selected_material = st.selectbox(
-                    "اختر الخامة (بالكود)", list(material_options.keys())
+                    "اختر الخامة (بالكود والاسم)",
+                    list(material_options.keys()),
                 )
             else:
-                st.warning("⚠️ يجب إضافة خامات أولاً")
+                st.warning("⚠️ لا توجد خامات مسجلة")
                 selected_material = None
 
         c4, c5 = st.columns(2)
@@ -464,27 +416,29 @@ elif st.session_state.current_page == "movements":
             )
         with c5:
             reference = st.text_input(
-                "رقم مرجعي (فاتورة/أمر)", placeholder="مثال: PO-123"
+                "رقم الإذن / الفاتورة", placeholder="مثال: PO-102"
             )
 
         c6, c7 = st.columns(2)
         with c6:
             party = st.text_input(
-                "الجهة / السبب", placeholder="مثال: مورد / خط إنتاج 1"
+                "الجهة / المورد / الخط", placeholder="مثال: شركة البدر / صالة 1"
             )
         with c7:
-            notes = st.text_input("ملاحظات")
+            notes = st.text_input("ملاحظات إضافية")
         st.markdown("</div>", unsafe_allow_html=True)
 
         submitted = st.form_submit_button(
-            "✅ تسجيل الحركة", type="primary", use_container_width=True
+            "✅ تسجيل الحركة في المخزن",
+            type="primary",
+            use_container_width=True,
         )
 
         if submitted:
             if selected_material is None:
-                st.error("❌ يجب اختيار خامة")
+                st.error("❌ يجب اختيار خامة مسجلة أولاً")
             elif qty <= 0:
-                st.error("❌ الكمية يجب أن تكون أكبر من صفر")
+                st.error("❌ يجب كتابة كمية أكبر من 0")
             else:
                 success, message = add_movement(
                     date=movement_date,
@@ -503,13 +457,13 @@ elif st.session_state.current_page == "movements":
                     )
                     conn.close()
                     st.info(
-                        f"📊 الرصيد الحالي للخامة: **{current_balance:,.2f} كجم**"
+                        f"📊 الرصيد الجديد للصنف: **{current_balance:,.2f} كجم**"
                     )
                 else:
                     st.error(f"❌ {message}")
 
     st.markdown("---")
-    st.markdown("### 📋 سجل الحركات المسجلة")
+    st.markdown("### 📋 سجل الحركات اليومية المسجلة")
     df_movements = movements_df()
     if not df_movements.empty:
         conn = connect()
@@ -538,8 +492,8 @@ elif st.session_state.current_page == "movements":
             "الوحدة",
             "النوع",
             "الكمية",
-            "الرصيد الحالي",
-            "المرجع",
+            "الرصيد الحقيقي",
+            "رقم الإذن",
             "الجهة",
         ]
         display_movements["النوع"] = display_movements["النوع"].apply(
@@ -555,21 +509,19 @@ elif st.session_state.current_page == "movements":
                 writer, index=False, sheet_name="حركة الخام"
             )
         st.download_button(
-            label="📥 تصدير الحركات إلى Excel",
+            label="📥 تصدير سجل الحركات إلى إكسيل",
             data=buf.getvalue(),
             file_name=f"rofa_movements_{date.today().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
-    else:
-        st.info("📭 لا توجد حركات مسجلة حتى الآن.")
 
 # ------------------------------------------------------------------------------
 # PAGE 3: إضافة خامة جديدة
 # ------------------------------------------------------------------------------
 elif st.session_state.current_page == "add_material":
     st.markdown(
-        '<div class="section-header">➕ إضافة خامة جديدة للمخزن</div>',
+        '<div class="section-header">➕ إضافة خامة أو منتج جديد للمخزن</div>',
         unsafe_allow_html=True,
     )
     with st.form("add_material_form", clear_on_submit=True):
@@ -587,24 +539,22 @@ elif st.session_state.current_page == "add_material":
         c4, c5 = st.columns(2)
         with c4:
             bag_weight = st.number_input(
-                "وزن الشكارة القياسي (كجم)", min_value=0.1, value=25.0, step=0.5
+                "وزن الشكارة / الطرد (كجم)", min_value=0.1, value=25.0, step=0.5
             )
         with c5:
             opening_balance = st.number_input(
                 "الرصيد الافتتاحي (كجم)", min_value=0.0, value=0.0, step=0.01
             )
 
-        notes = st.text_area(
-            "ملاحظات", placeholder="أي معلومات إضافية عن الخامة..."
-        )
+        notes = st.text_area("ملاحظات", placeholder="مواصفات أو بيانات إضافية...")
         st.markdown("</div>", unsafe_allow_html=True)
 
         submitted = st.form_submit_button(
-            "✅ إضافة الخامة", type="primary", use_container_width=True
+            "✅ إضافة الصنف فوراً", type="primary", use_container_width=True
         )
         if submitted:
             if not code or not name:
-                st.error("❌ يجب ملء حقلي الكود والاسم")
+                st.error("❌ يجب كتابة الكود والاسم بشكل صحيح")
             else:
                 success, message = add_material(
                     code=code,
@@ -620,11 +570,11 @@ elif st.session_state.current_page == "add_material":
                     st.error(f"❌ {message}")
 
 # ------------------------------------------------------------------------------
-# PAGE 4: التقارير
+# PAGE 4: التقارير والتصدير
 # ------------------------------------------------------------------------------
 elif st.session_state.current_page == "reports":
     st.markdown(
-        '<div class="section-header">📊 التقارير والإحصائيات</div>',
+        '<div class="section-header">📊 التقارير والإحصائيات الشاملة</div>',
         unsafe_allow_html=True,
     )
     try:
@@ -699,19 +649,5 @@ elif st.session_state.current_page == "reports":
                     writer, index=False, sheet_name="تقرير المخزن"
                 )
             st.download_button(
-                label="📥 تصدير التقرير إلى Excel",
+                label="📥 تصدير التقرير النهائي إلى Excel",
                 data=buf.getvalue(),
-                file_name=f"rofa_report_{date.today().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        else:
-            st.info("📭 لا توجد بيانات للتقرير")
-    except Exception as e:
-        st.error(f"خطأ: {str(e)}")
-
-st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: #64748b; padding: 20px;'><strong>نظام ROFA لمخزن الخامات</strong></div>",
-    unsafe_allow_html=True,
-)
