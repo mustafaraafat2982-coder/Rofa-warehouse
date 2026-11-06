@@ -1,34 +1,19 @@
-"""Rofa Warehouse - قاعدة البيانات وقواعد العمل (بدون أي كود واجهة)."""
+import base64
+from datetime import date, datetime
 import io
 import os
 import sqlite3
-import tempfile
-from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
-DB_FILE = os.environ.get("ROFA_DB", "rofa_warehouse_v2.db")
-LEGACY_DB = "rofa_warehouse.db"  # قاعدة النسخة الأولى (يتم ترحيلها تلقائياً)
-
-DOC_TYPES = ["IN", "OUT", "RETURN_IN", "RETURN_OUT", "TRANSFER", "ADJUST"]
-DOC_PREFIX = {"IN": "IN", "OUT": "OUT", "RETURN_IN": "RIN", "RETURN_OUT": "ROUT",
-              "TRANSFER": "TRF", "ADJUST": "ADJ"}
-INCREASE = {"IN", "RETURN_IN"}
-DECREASE = {"OUT", "RETURN_OUT"}
-EPS = 1e-9
+# ==============================================================================
+# BACKEND - نظام مخزن الخامات (ROFA)
+# ==============================================================================
+DB_FILE = os.environ.get("ROFA_DB", "rofa_raw_materials.db")
 
 
-class AppError(Exception):
-    """خطأ منطقي يعرض للمستخدم برسالة مترجمة (key + params)."""
-
-    def __init__(self, key, **params):
-        super().__init__(key)
-        self.key = key
-        self.params = params
-
-
-# ---------------------------------------------------------------- الاتصال
 def connect():
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -36,647 +21,697 @@ def connect():
 
 
 def q(sql, params=()):
-    conn = connect()
     try:
+        conn = connect()
         return pd.read_sql_query(sql, conn, params=params)
+    except Exception:
+        return pd.DataFrame()
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS warehouses(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
-    location TEXT, active INTEGER NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS categories(
-    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL);
-CREATE TABLE IF NOT EXISTS items(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, category TEXT,
-    unit TEXT NOT NULL DEFAULT 'Pcs', min_stock REAL NOT NULL DEFAULT 0,
-    cost REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0,
-    active INTEGER NOT NULL DEFAULT 1, notes TEXT);
-CREATE TABLE IF NOT EXISTS partners(
-    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-    type TEXT NOT NULL DEFAULT 'SUPPLIER', phone TEXT, notes TEXT);
-CREATE TABLE IF NOT EXISTS documents(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    doc_no TEXT UNIQUE NOT NULL, type TEXT NOT NULL, date TEXT NOT NULL,
-    warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
-    to_warehouse_id INTEGER REFERENCES warehouses(id),
-    partner_id INTEGER REFERENCES partners(id),
-    reference TEXT, notes TEXT, status TEXT NOT NULL DEFAULT 'Approved',
-    created_at TEXT, cancelled_at TEXT);
-CREATE TABLE IF NOT EXISTS document_lines(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    document_id INTEGER NOT NULL REFERENCES documents(id),
-    item_id INTEGER NOT NULL REFERENCES items(id),
-    qty REAL NOT NULL, unit_cost REAL NOT NULL DEFAULT 0,
-    batch_no TEXT, expiry TEXT);
-CREATE TABLE IF NOT EXISTS ledger(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    document_id INTEGER NOT NULL REFERENCES documents(id),
-    item_id INTEGER NOT NULL REFERENCES items(id),
-    warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
-    in_qty REAL NOT NULL DEFAULT 0, out_qty REAL NOT NULL DEFAULT 0,
-    date TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS ix_ledger_item ON ledger(item_id, warehouse_id);
-CREATE INDEX IF NOT EXISTS ix_ledger_doc ON ledger(document_id);
-CREATE INDEX IF NOT EXISTS ix_lines_doc ON document_lines(document_id);
-CREATE INDEX IF NOT EXISTS ix_docs_date ON documents(date);
+CREATE TABLE IF NOT EXISTS raw_materials(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    code TEXT UNIQUE NOT NULL, 
+    name TEXT NOT NULL, 
+    unit TEXT NOT NULL DEFAULT 'كجم',
+    bag_weight REAL NOT NULL DEFAULT 25,
+    opening_balance REAL NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1, 
+    notes TEXT
+);
+CREATE TABLE IF NOT EXISTS movements(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+    date TEXT NOT NULL,
+    material_id INTEGER NOT NULL REFERENCES raw_materials(id),
+    movement_type TEXT NOT NULL,
+    qty REAL NOT NULL,
+    reference TEXT,
+    party TEXT,
+    notes TEXT,
+    created_at TEXT
+);
 """
 
 
 def init_db():
-    conn = connect()
     try:
+        conn = connect()
         conn.executescript(SCHEMA)
-        if conn.execute("SELECT COUNT(*) FROM warehouses").fetchone()[0] == 0:
-            conn.execute("INSERT INTO warehouses(code, name, location) VALUES ('MAIN', 'المخزن الرئيسي', '')")
-        conn.commit()
-        _migrate_legacy(conn)
-    finally:
         conn.close()
+    except Exception as e:
+        st.error(f"خطأ في تهيئة قاعدة البيانات: {str(e)}")
 
 
-def _migrate_legacy(conn):
-    """ترحيل بيانات النسخة الأولى (إن وُجدت) إلى الهيكل الجديد مرة واحدة."""
-    if not os.path.exists(LEGACY_DB) or os.path.abspath(LEGACY_DB) == os.path.abspath(DB_FILE):
-        return
-    if conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] > 0:
-        return
-    old = None
+def materials_df(active_only=True):
     try:
-        old = sqlite3.connect(LEGACY_DB)
-        tables = {r[0] for r in old.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if not {"items", "stock_documents", "stock_ledger"} <= tables:
-            return
-        wh = conn.execute("SELECT id FROM warehouses ORDER BY id LIMIT 1").fetchone()[0]
-        for r in old.execute("SELECT id, code, name, unit, min_stock, notes FROM items"):
-            conn.execute("INSERT INTO items(id, code, name, unit, min_stock, notes) VALUES (?,?,?,?,?,?)", r)
-        tmap = {"IN": "IN", "OUT": "OUT", "RETURN": "RETURN_IN", "ADJUST": "ADJUST"}
-        for r in old.execute("SELECT id, doc_no, type, date, reference, status FROM stock_documents"):
-            conn.execute(
-                "INSERT INTO documents(id, doc_no, type, date, warehouse_id, reference, status, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (r[0], r[1], tmap.get(r[2], r[2]), r[3], wh, r[4], r[5] or "Approved", r[3]))
-        for r in old.execute("SELECT document_id, item_id, qty, batch_no FROM stock_document_items"):
-            conn.execute("INSERT INTO document_lines(document_id, item_id, qty, batch_no) VALUES (?,?,?,?)", r)
-        for r in old.execute("SELECT item_id, in_qty, out_qty, document_id, date FROM stock_ledger"):
-            conn.execute(
-                "INSERT INTO ledger(item_id, in_qty, out_qty, document_id, warehouse_id, date) VALUES (?,?,?,?,?,?)",
-                (r[0], r[1] or 0, r[2] or 0, r[3], wh, r[4] or date.today().isoformat()))
-        conn.commit()
+        sql = "SELECT id, code, name, unit, bag_weight, opening_balance, active, notes FROM raw_materials"
+        if active_only:
+            sql += " WHERE active=1"
+        return q(sql + " ORDER BY code")
     except Exception:
-        conn.rollback()
-    finally:
-        if old is not None:
-            old.close()
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "code",
+                "name",
+                "unit",
+                "bag_weight",
+                "opening_balance",
+                "active",
+                "notes",
+            ]
+        )
 
 
-# ---------------------------------------------------------------- جداول البيانات الأساسية
-def items_df(active_only=True):
-    sql = "SELECT id, code, name, category, unit, min_stock, cost, price, active, notes FROM items"
-    if active_only:
-        sql += " WHERE active=1"
-    return q(sql + " ORDER BY code")
+def movements_df():
+    return q("""SELECT m.id, m.date, m.material_id, r.code, r.name, r.unit, m.movement_type, m.qty, m.reference, m.party, m.notes
+                FROM movements m JOIN raw_materials r ON r.id = m.material_id
+                ORDER BY m.date DESC, m.id DESC""")
 
 
-def warehouses_df(active_only=True):
-    sql = "SELECT id, code, name, location, active FROM warehouses"
-    if active_only:
-        sql += " WHERE active=1"
-    return q(sql + " ORDER BY id")
+def get_material_totals():
+    totals = q("""
+        SELECT material_id,
+               SUM(CASE WHEN movement_type='IN' THEN qty ELSE 0 END) as total_in,
+               SUM(CASE WHEN movement_type='OUT' THEN qty ELSE 0 END) as total_out
+        FROM movements
+        GROUP BY material_id
+    """)
+    return totals
 
 
-def partners_df():
-    return q("SELECT id, name, type, phone, notes FROM partners ORDER BY name")
+def get_current_balance(conn, material_id):
+    material = conn.execute(
+        "SELECT opening_balance FROM raw_materials WHERE id=?", (material_id,)
+    ).fetchone()
+    if not material:
+        return 0
+    opening = material[0]
+
+    totals = conn.execute(
+        """
+        SELECT 
+            COALESCE(SUM(CASE WHEN movement_type='IN' THEN qty ELSE 0 END), 0) as total_in,
+            COALESCE(SUM(CASE WHEN movement_type='OUT' THEN qty ELSE 0 END), 0) as total_out
+        FROM movements WHERE material_id=?
+    """,
+        (material_id,),
+    ).fetchone()
+
+    return opening + totals[0] - totals[1]
 
 
-def categories_df():
-    return q("SELECT id, name FROM categories ORDER BY name")
-
-
-# ---------------------------------------------------------------- الأرصدة
-def stock_rows():
-    """رصيد كل صنف في كل مخزن (المستندات المعتمدة فقط)."""
-    return q("""SELECT l.item_id, l.warehouse_id, SUM(l.in_qty - l.out_qty) AS qty
-                FROM ledger l JOIN documents d ON d.id = l.document_id
-                WHERE d.status = 'Approved' GROUP BY l.item_id, l.warehouse_id""")
-
-
-def stock_overview(warehouse_id=None, include_inactive=False):
-    df = items_df(active_only=not include_inactive)
-    rows = stock_rows()
-    if warehouse_id is not None and not rows.empty:
-        rows = rows[rows["warehouse_id"] == warehouse_id]
-    if rows.empty or df.empty:
-        df["qty"] = 0.0
-    else:
-        tot = rows.groupby("item_id")["qty"].sum()
-        df["qty"] = df["id"].map(tot).fillna(0.0).astype(float).round(6)
-    df["value"] = df["qty"] * df["cost"].fillna(0)
-    df["status"] = np.where(df["qty"] <= EPS, "out", np.where(df["qty"] <= df["min_stock"], "low", "ok"))
-    return df
-
-
-def available(conn, item_id, warehouse_id):
-    r = conn.execute(
-        """SELECT COALESCE(SUM(l.in_qty - l.out_qty), 0) FROM ledger l
-           JOIN documents d ON d.id = l.document_id
-           WHERE d.status='Approved' AND l.item_id=? AND l.warehouse_id=?""",
-        (item_id, warehouse_id)).fetchone()
-    return round(r[0], 6)
-
-
-def total_qty(conn, item_id):
-    r = conn.execute(
-        """SELECT COALESCE(SUM(l.in_qty - l.out_qty), 0) FROM ledger l
-           JOIN documents d ON d.id = l.document_id
-           WHERE d.status='Approved' AND l.item_id=?""", (item_id,)).fetchone()
-    return round(r[0], 6)
-
-
-# ---------------------------------------------------------------- المستندات
-def next_doc_no(conn, doc_type):
-    year = date.today().year
-    n = conn.execute("SELECT COUNT(*) FROM documents WHERE type=?", (doc_type,)).fetchone()[0] + 1
-    while True:
-        no = f"{DOC_PREFIX[doc_type]}-{year}-{n:04d}"
-        if not conn.execute("SELECT 1 FROM documents WHERE doc_no=?", (no,)).fetchone():
-            return no
-        n += 1
-
-
-def peek_next_doc_no(doc_type):
+def add_material(code, name, unit, bag_weight, opening_balance, notes=""):
     conn = connect()
     try:
-        return next_doc_no(conn, doc_type)
+        conn.execute(
+            """INSERT INTO raw_materials(code, name, unit, bag_weight, opening_balance, notes) 
+                       VALUES (?,?,?,?,?,?)""",
+            (code, name, unit, bag_weight, opening_balance, notes),
+        )
+        conn.commit()
+        return True, "تم إضافة الخامة بنجاح"
+    except sqlite3.IntegrityError:
+        return False, "كود الخامة موجود مسبقاً"
+    except Exception as e:
+        conn.rollback()
+        return False, f"خطأ: {str(e)}"
     finally:
         conn.close()
 
 
-def _num(v, default=0.0):
-    try:
-        if v is None or pd.isna(v):
-            return default
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _txt(v):
-    if v is None:
-        return None
-    try:
-        if pd.isna(v):
-            return None
-    except (TypeError, ValueError):
-        pass
-    v = str(v).strip()
-    return v or None
-
-
-def _item_code(conn, item_id):
-    r = conn.execute("SELECT code FROM items WHERE id=?", (item_id,)).fetchone()
-    return r[0] if r else str(item_id)
-
-
-def create_document(doc_type, doc_date, warehouse_id, lines, to_warehouse_id=None,
-                    partner_id=None, reference="", notes="", doc_no=None):
-    """ينشئ مستنداً (وارد/صادر/مرتجع/تحويل) كعملية واحدة متكاملة (all-or-nothing)."""
-    if doc_type not in DOC_TYPES or doc_type == "ADJUST":
-        raise AppError("err_bad_type")
-    clean = []
-    for ln in lines:
-        iid = ln.get("item_id")
-        if iid is None or (isinstance(iid, float) and pd.isna(iid)):
-            continue
-        qty = _num(ln.get("qty"))
-        if qty <= 0:
-            raise AppError("err_qty_positive")
-        clean.append({"item_id": int(iid), "qty": qty, "unit_cost": _num(ln.get("unit_cost")),
-                      "batch_no": _txt(ln.get("batch_no")), "expiry": _txt(ln.get("expiry"))})
-    if not clean:
-        raise AppError("err_no_lines")
-    if doc_type == "TRANSFER":
-        if not to_warehouse_id or int(to_warehouse_id) == int(warehouse_id):
-            raise AppError("err_transfer_wh")
-
+def add_movement(
+    date, material_id, movement_type, qty, reference="", party="", notes=""
+):
     conn = connect()
     try:
-        # منع الرصيد السالب
-        if doc_type in DECREASE or doc_type == "TRANSFER":
-            need = {}
-            for ln in clean:
-                need[ln["item_id"]] = need.get(ln["item_id"], 0) + ln["qty"]
-            for iid, n in need.items():
-                av = available(conn, iid, warehouse_id)
-                if av + EPS < n:
-                    raise AppError("err_insufficient", item=_item_code(conn, iid), avail=av, need=n)
+        if movement_type == "OUT":
+            current_balance = get_current_balance(conn, material_id)
+            if current_balance < qty:
+                return (
+                    False,
+                    f"الرصيد غير كافٍ. المتاح: {current_balance:.2f}، المطلوب: {qty}",
+                )
 
-        no = (doc_no or "").strip() or next_doc_no(conn, doc_type)
-        if conn.execute("SELECT 1 FROM documents WHERE doc_no=?", (no,)).fetchone():
-            raise AppError("err_doc_exists", doc_no=no)
-
-        cur = conn.execute(
-            """INSERT INTO documents(doc_no, type, date, warehouse_id, to_warehouse_id, partner_id,
-                                     reference, notes, status, created_at)
-               VALUES (?,?,?,?,?,?,?,?, 'Approved', ?)""",
-            (no, doc_type, str(doc_date), int(warehouse_id),
-             int(to_warehouse_id) if doc_type == "TRANSFER" else None,
-             int(partner_id) if partner_id else None, _txt(reference), _txt(notes),
-             datetime.now().isoformat(timespec="seconds")))
-        doc_id = cur.lastrowid
-
-        for ln in clean:
-            iid, qty, uc = ln["item_id"], ln["qty"], ln["unit_cost"]
-            row = conn.execute("SELECT cost FROM items WHERE id=?", (iid,)).fetchone()
-            if row is None:
-                raise AppError("err_item_missing")
-            cost = row[0] or 0.0
-            if doc_type == "IN" and uc > 0:
-                # متوسط التكلفة المرجّح
-                base = max(total_qty(conn, iid), 0.0)
-                new_cost = (base * cost + qty * uc) / (base + qty)
-                conn.execute("UPDATE items SET cost=? WHERE id=?", (round(new_cost, 4), iid))
-            elif uc <= 0:
-                uc = cost
-            conn.execute(
-                "INSERT INTO document_lines(document_id, item_id, qty, unit_cost, batch_no, expiry) VALUES (?,?,?,?,?,?)",
-                (doc_id, iid, qty, uc, ln["batch_no"], ln["expiry"]))
-            if doc_type in INCREASE:
-                legs = [(warehouse_id, qty, 0)]
-            elif doc_type in DECREASE:
-                legs = [(warehouse_id, 0, qty)]
-            else:  # TRANSFER
-                legs = [(warehouse_id, 0, qty), (to_warehouse_id, qty, 0)]
-            for wid, i_q, o_q in legs:
-                conn.execute(
-                    "INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) VALUES (?,?,?,?,?,?)",
-                    (doc_id, iid, int(wid), i_q, o_q, str(doc_date)))
+        conn.execute(
+            """INSERT INTO movements(date, material_id, movement_type, qty, reference, party, notes, created_at)
+                             VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                str(date),
+                int(material_id),
+                movement_type,
+                float(qty),
+                reference,
+                party,
+                notes,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
         conn.commit()
-        return doc_id, no
+        return True, "تم تسجيل الحركة بنجاح"
+    except Exception as e:
+        conn.rollback()
+        return False, f"خطأ: {str(e)}"
+    finally:
+        conn.close()
+
+
+def update_material(item_id, field, value):
+    try:
+        conn = connect()
+        conn.execute(
+            f"UPDATE raw_materials SET {field}=? WHERE id=?", (value, item_id)
+        )
+        conn.commit()
+        conn.close()
+        return True
     except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        return False
 
 
-def create_adjustment(warehouse_id, counts, notes="", doc_date=None):
-    """تسوية جرد: counts = [(item_id, counted_qty)]. يحسب الفرق لحظة الاعتماد."""
-    doc_date = str(doc_date or date.today())
-    conn = connect()
-    try:
-        changes = []
-        for iid, counted in counts:
-            book = available(conn, int(iid), warehouse_id)
-            diff = round(float(counted) - book, 6)
-            if abs(diff) > EPS:
-                changes.append((int(iid), diff))
-        if not changes:
-            return None, 0
-        no = next_doc_no(conn, "ADJUST")
-        cur = conn.execute(
-            """INSERT INTO documents(doc_no, type, date, warehouse_id, reference, notes, status, created_at)
-               VALUES (?, 'ADJUST', ?, ?, 'Stock count', ?, 'Approved', ?)""",
-            (no, doc_date, int(warehouse_id), _txt(notes), datetime.now().isoformat(timespec="seconds")))
-        doc_id = cur.lastrowid
-        for iid, diff in changes:
-            cost = conn.execute("SELECT cost FROM items WHERE id=?", (iid,)).fetchone()[0] or 0.0
-            conn.execute("INSERT INTO document_lines(document_id, item_id, qty, unit_cost) VALUES (?,?,?,?)",
-                         (doc_id, iid, diff, cost))
-            conn.execute(
-                "INSERT INTO ledger(document_id, item_id, warehouse_id, in_qty, out_qty, date) VALUES (?,?,?,?,?,?)",
-                (doc_id, iid, int(warehouse_id), max(diff, 0), max(-diff, 0), doc_date))
-        conn.commit()
-        return no, len(changes)
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+# ==============================================================================
+# FRONTEND - واجهة المستخدم Streamlit
+# ==============================================================================
+st.set_page_config(
+    page_title="نظام ROFA لمخزن الخامات",
+    page_icon="📦",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
+init_db()
 
-def cancel_document(doc_id):
-    """إلغاء مستند (لا يُحذف - يبقى في السجل بحالة ملغي) بشرط ألا يسبّب رصيداً سالباً."""
-    conn = connect()
-    try:
-        d = conn.execute("SELECT status FROM documents WHERE id=?", (doc_id,)).fetchone()
-        if not d:
-            raise AppError("err_doc_missing")
-        if d[0] != "Approved":
-            raise AppError("err_already_cancelled")
-        rows = conn.execute(
-            """SELECT item_id, warehouse_id, SUM(in_qty - out_qty) FROM ledger
-               WHERE document_id=? GROUP BY item_id, warehouse_id""", (doc_id,)).fetchall()
-        for iid, wid, net in rows:
-            if net > EPS:
-                av = available(conn, iid, wid)
-                if av + EPS < net:
-                    raise AppError("err_cancel_insufficient", item=_item_code(conn, iid), avail=av, need=net)
-        conn.execute("UPDATE documents SET status='Cancelled', cancelled_at=? WHERE id=?",
-                     (datetime.now().isoformat(timespec="seconds"), doc_id))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+LOGO_PATH = "rofa_logo.png"
+logo_html = ""
+if os.path.exists(LOGO_PATH):
+    with open(LOGO_PATH, "rb") as f:
+        logo_b64 = base64.b64encode(f.read()).decode()
+    logo_html = f'<img src="data:image/png;base64,{logo_b64}" style="height: 70px; margin-left: 20px;">'
 
+st.markdown(
+    """
+<style>
+    .stApp, .main .block-container { background-color: #f5f0e1 !important; }
+    .header-container {
+        display: flex; align-items: center; justify-content: flex-start;
+        padding: 15px 20px; background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 100%);
+        border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(30, 58, 138, 0.3);
+    }
+    .header-title { font-size: 26px; font-weight: 700; color: white; margin: 0; }
+    .header-subtitle { font-size: 13px; color: #dbeafe; margin: 4px 0 0 0; }
+    .nav-container {
+        display: flex; gap: 10px; padding: 12px; background-color: #1e3a8a;
+        border-radius: 12px; margin-bottom: 24px; box-shadow: 0 4px 6px rgba(30, 58, 138, 0.2);
+    }
+    .stTextInput > div > div > input, .stNumberInput > div > div > input, .stSelectbox > div > div > div, .stTextArea > div > div > textarea {
+        background-color: #ffffff !important; color: #1e293b !important; border: 1px solid #cbd5e1 !important; font-weight: 500;
+    }
+    label, .stTextInput label, .stNumberInput label, .stSelectbox label, .stTextArea label {
+        color: #1e3a8a !important; font-weight: 600 !important; font-size: 14px !important;
+    }
+    .stButton > button { background-color: #1e40af !important; color: white !important; border: none !important; font-weight: 600; padding: 10px 24px; border-radius: 8px; }
+    .stButton > button:hover { background-color: #3b82f6 !important; }
+    .stat-card { background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); text-align: center; border-right: 4px solid #1e40af; }
+    .stat-value { font-size: 28px; font-weight: 700; color: #1e40af; margin: 8px 0; }
+    .stat-label { font-size: 14px; color: #64748b; font-weight: 600; }
+    #MainMenu, footer, header {visibility: hidden;}
+    .section-header { background-color: #1e3a8a; color: white; padding: 12px 20px; border-radius: 8px; margin: 24px 0 16px 0; font-size: 18px; font-weight: 700; }
+    .form-container { background: white; padding: 24px; border-radius: 12px; border: 1px solid #e2e8f0; margin: 16px 0; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-def update_document_meta(doc_id, reference, notes):
-    conn = connect()
-    try:
-        conn.execute("UPDATE documents SET reference=?, notes=? WHERE id=?",
-                     (_txt(reference), _txt(notes), doc_id))
-        conn.commit()
-    finally:
-        conn.close()
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "raw_materials"
 
+st.markdown(
+    f"""
+<div class="header-container">
+    {logo_html if logo_html else '<div style="width: 70px; height: 70px; background: white; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-left: 20px; font-size: 32px;">📦</div>'}
+    <div>
+        <h1 class="header-title">نظام ROFA لمخزن الخامات</h1>
+        <p class="header-subtitle">إدارة خامات البلاستيك والأنواع المختلفة - الوارد والمنصرف والأرصدة</p>
+    </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
-def documents_df():
-    return q("""
-        SELECT d.id, d.doc_no, d.type, d.date, d.status, d.reference, d.notes,
-               w.name AS warehouse, w2.name AS to_warehouse, p.name AS partner,
-               (SELECT COUNT(*) FROM document_lines x WHERE x.document_id = d.id) AS lines,
-               (SELECT COALESCE(SUM(ABS(x.qty)), 0) FROM document_lines x WHERE x.document_id = d.id) AS total_qty,
-               (SELECT COALESCE(SUM(ABS(x.qty) * x.unit_cost), 0) FROM document_lines x WHERE x.document_id = d.id) AS total_value
-        FROM documents d
-        JOIN warehouses w ON w.id = d.warehouse_id
-        LEFT JOIN warehouses w2 ON w2.id = d.to_warehouse_id
-        LEFT JOIN partners p ON p.id = d.partner_id
-        ORDER BY d.date DESC, d.id DESC""")
-
-
-def document_lines_df(doc_id):
-    return q("""SELECT i.code, i.name, i.unit, x.qty, x.unit_cost, x.qty * x.unit_cost AS value,
-                       x.batch_no, x.expiry
-                FROM document_lines x JOIN items i ON i.id = x.item_id
-                WHERE x.document_id = ? ORDER BY x.id""", (doc_id,))
-
-
-# ---------------------------------------------------------------- كارت الحركة والتقارير
-def ledger_df(include_cancelled=False):
-    df = q("""SELECT l.id AS ledger_id, l.date, d.doc_no, d.type, d.status, d.reference,
-                     l.warehouse_id, w.name AS warehouse, l.item_id, i.code, i.name AS item, i.unit,
-                     l.in_qty, l.out_qty, p.name AS partner
-              FROM ledger l
-              JOIN documents d ON d.id = l.document_id
-              JOIN items i ON i.id = l.item_id
-              JOIN warehouses w ON w.id = l.warehouse_id
-              LEFT JOIN partners p ON p.id = d.partner_id
-              ORDER BY l.date, l.id""")
-    if df.empty:
-        df["balance"] = pd.Series(dtype=float)
-        return df
-    net = np.where(df["status"] == "Approved", df["in_qty"] - df["out_qty"], 0.0)
-    df["balance"] = pd.Series(net, index=df.index).groupby([df["item_id"], df["warehouse_id"]]).cumsum().round(6)
-    if not include_cancelled:
-        df = df[df["status"] == "Approved"]
-    return df
-
-
-def movement_summary(d_from, d_to, warehouse_id=None):
-    led = ledger_df()
-    items = items_df()
-    if warehouse_id is not None and not led.empty:
-        led = led[led["warehouse_id"] == warehouse_id]
-    res = items[["id", "code", "name", "category", "unit", "cost"]].copy()
-    if led.empty:
-        res["opening"] = res["in_qty"] = res["out_qty"] = 0.0
-    else:
-        led = led.assign(net=led["in_qty"] - led["out_qty"])
-        before = led[led["date"] < d_from].groupby("item_id")["net"].sum()
-        within = led[(led["date"] >= d_from) & (led["date"] <= d_to)]
-        res["opening"] = res["id"].map(before).fillna(0.0)
-        res["in_qty"] = res["id"].map(within.groupby("item_id")["in_qty"].sum()).fillna(0.0)
-        res["out_qty"] = res["id"].map(within.groupby("item_id")["out_qty"].sum()).fillna(0.0)
-    res["closing"] = res["opening"] + res["in_qty"] - res["out_qty"]
-    res["value"] = res["closing"] * res["cost"]
-    return res.drop(columns=["id"])
-
-
-def slow_moving(days, warehouse_id=None):
-    ov = stock_overview(warehouse_id)
-    ov = ov[ov["qty"] > EPS].copy()
-    led = ledger_df()
-    if not led.empty:
-        led = led[(led["out_qty"] > 0) & (led["type"].isin(["OUT", "RETURN_OUT"]))]
-        if warehouse_id is not None:
-            led = led[led["warehouse_id"] == warehouse_id]
-    last = led.groupby("item_id")["date"].max() if not led.empty else pd.Series(dtype=object)
-    ov["last_out"] = ov["id"].map(last)
-    today = date.today()
-    ov["days"] = pd.to_numeric(
-        ov["last_out"].map(lambda d: (today - date.fromisoformat(d)).days if isinstance(d, str) else None),
-        errors="coerce")
-    return ov[ov["days"].isna() | (ov["days"] >= days)]
-
-
-# ---------------------------------------------------------------- تعديل الجداول مباشرة (Quick edit)
-GRID = {
-    "items": {
-        "cols": ["code", "name", "category", "unit", "min_stock", "cost", "price", "active", "notes"],
-        "required": ["code", "name", "unit"], "label": "code",
-        "defaults": {"unit": "Pcs", "min_stock": 0, "cost": 0, "price": 0, "active": 1},
-        "usage": "SELECT (SELECT COUNT(*) FROM ledger WHERE item_id=:id) + "
-                 "(SELECT COUNT(*) FROM document_lines WHERE item_id=:id)"},
-    "warehouses": {
-        "cols": ["code", "name", "location", "active"],
-        "required": ["code", "name"], "label": "name", "defaults": {"active": 1},
-        "usage": "SELECT (SELECT COUNT(*) FROM documents WHERE warehouse_id=:id OR to_warehouse_id=:id) + "
-                 "(SELECT COUNT(*) FROM ledger WHERE warehouse_id=:id)"},
-    "partners": {
-        "cols": ["name", "type", "phone", "notes"],
-        "required": ["name"], "label": "name", "defaults": {"type": "SUPPLIER"},
-        "usage": "SELECT COUNT(*) FROM documents WHERE partner_id=:id"},
-    "categories": {
-        "cols": ["name"], "required": ["name"], "label": "name", "defaults": {},
-        "usage": "SELECT COUNT(*) FROM items WHERE category=(SELECT name FROM categories WHERE id=:id)"},
+nav_pages = {
+    "raw_materials": "📦 مخزن الخام (الرئيسية)",
+    "movements": "🔄 حركة الخام",
+    "add_material": "➕ إضافة خامة جديدة",
+    "reports": "📊 التقارير",
 }
 
+st.markdown('<div class="nav-container">', unsafe_allow_html=True)
+cols = st.columns(len(nav_pages))
+for idx, (page_key, page_name) in enumerate(nav_pages.items()):
+    with cols[idx]:
+        if st.button(
+            page_name, key=f"nav_{page_key}", use_container_width=True
+        ):
+            st.session_state.current_page = page_key
+            st.rerun()
+st.markdown("</div>", unsafe_allow_html=True)
 
-def _clean(v):
-    if v is None:
-        return None
-    if isinstance(v, (bool, np.bool_)):
-        return int(v)
-    if isinstance(v, np.generic):
-        v = v.item()
+# ------------------------------------------------------------------------------
+# PAGE 1: مخزن الخام (الرئيسية)
+# ------------------------------------------------------------------------------
+if st.session_state.current_page == "raw_materials":
+    st.markdown(
+        '<div class="section-header">📦 مخزن الخام - لوحة الأرصدة الرئيسية</div>',
+        unsafe_allow_html=True,
+    )
+
     try:
-        if pd.isna(v):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if isinstance(v, str):
-        v = v.strip()
-        return v or None
-    return v
+        df_materials = materials_df(active_only=False)
+        df_totals = get_material_totals()
 
-
-def _blank(v):
-    return v is None or v == 0 and isinstance(v, bool) or v == ""
-
-
-def apply_grid_changes(table, orig, edited):
-    """يطبّق تعديلات الجدول (إضافة/تعديل/حذف). كل شيء أو لا شيء.
-    يعيد (counts, errors) حيث errors قائمة (key, params)."""
-    cfg = GRID[table]
-    cols = cfg["cols"]
-    errors, added, updated, deleted = [], 0, 0, 0
-    conn = connect()
-    try:
-        orig_map = {}
-        for rec in orig.to_dict("records"):
-            orig_map[int(rec["id"])] = {c: _clean(rec.get(c)) for c in cols}
-        seen = set()
-        for rec in edited.to_dict("records"):
-            rid = rec.get("id")
-            new = {c: _clean(rec.get(c)) for c in cols}
-            label = new.get(cfg["label"]) or ""
-            if rid is None or pd.isna(rid):  # صف جديد
-                if all(v is None or v == 0 for v in new.values()):
-                    continue
-                for c, dv in cfg["defaults"].items():
-                    if new[c] is None:
-                        new[c] = dv
-                if any(new[c] is None for c in cfg["required"]):
-                    errors.append(("err_required", {"row": label or "?"}))
-                    continue
-                try:
-                    conn.execute(f"INSERT INTO {table}({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-                                 [new[c] for c in cols])
-                    added += 1
-                except sqlite3.IntegrityError:
-                    errors.append(("err_duplicate", {"row": label}))
+        if not df_materials.empty:
+            if not df_totals.empty:
+                df_materials = df_materials.merge(
+                    df_totals, left_on="id", right_on="material_id", how="left"
+                )
+                df_materials["total_in"] = df_materials["total_in"].fillna(0)
+                df_materials["total_out"] = df_materials["total_out"].fillna(0)
             else:
-                rid = int(rid)
-                seen.add(rid)
-                old = orig_map.get(rid)
-                if old is None or old == new:
-                    continue
-                for c, dv in cfg["defaults"].items():
-                    if new[c] is None:
-                        new[c] = dv
-                if any(new[c] is None for c in cfg["required"]):
-                    errors.append(("err_required", {"row": label or str(rid)}))
-                    continue
-                try:
-                    conn.execute(f"UPDATE {table} SET {','.join(c + '=?' for c in cols)} WHERE id=?",
-                                 [new[c] for c in cols] + [rid])
-                    if table == "categories" and old["name"] != new["name"]:
-                        conn.execute("UPDATE items SET category=? WHERE category=?", (new["name"], old["name"]))
-                    updated += 1
-                except sqlite3.IntegrityError:
-                    errors.append(("err_duplicate", {"row": label}))
-        for rid in set(orig_map) - seen:  # صفوف محذوفة
-            used = conn.execute(cfg["usage"], {"id": rid}).fetchone()[0]
-            label = orig_map[rid].get(cfg["label"]) or str(rid)
-            if used:
-                errors.append(("err_in_use", {"row": label}))
-                continue
-            conn.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
-            deleted += 1
-        if errors:
-            conn.rollback()
-            return {"added": 0, "updated": 0, "deleted": 0}, errors
-        conn.commit()
-        return {"added": added, "updated": updated, "deleted": deleted}, []
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
+                df_materials["total_in"] = 0
+                df_materials["total_out"] = 0
+
+            df_materials["remaining"] = (
+                df_materials["opening_balance"]
+                + df_materials["total_in"]
+                - df_materials["total_out"]
+            )
+            df_materials["bags_count"] = (
+                df_materials["remaining"] / df_materials["bag_weight"]
+            ).round(2)
+
+            total_materials = len(df_materials)
+            total_remaining = df_materials["remaining"].sum()
+            total_bags = df_materials["bags_count"].sum()
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown(
+                    f'<div class="stat-card"><div class="stat-label">إجمالي الخامات</div><div class="stat-value">{total_materials}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                st.markdown(
+                    f'<div class="stat-card"><div class="stat-label">إجمالي المتبقي (كجم)</div><div class="stat-value">{total_remaining:,.2f}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                st.markdown(
+                    f'<div class="stat-card"><div class="stat-label">إجمالي الشكاير</div><div class="stat-value">{total_bags:,.1f}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            with c4:
+                st.markdown(
+                    '<div class="stat-card"><div class="stat-label">حالة النظام</div><div class="stat-value" style="color: #166534;">نشط</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("---")
+            st.markdown("### 📋 جدول أرصدة الخامات")
+            display_df = df_materials[
+                [
+                    "code",
+                    "name",
+                    "unit",
+                    "bag_weight",
+                    "opening_balance",
+                    "total_in",
+                    "total_out",
+                    "remaining",
+                    "bags_count",
+                    "notes",
+                ]
+            ].copy()
+            display_df.columns = [
+                "الكود",
+                "اسم الخامة",
+                "الوحدة",
+                "وزن الشكارة",
+                "الافتتاحي",
+                "الوارد",
+                "المنصرف",
+                "المتبقي (كجم)",
+                "عدد الشكاير",
+                "ملاحظات",
+            ]
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.markdown("### ✏️ تعديل بيانات الخامات")
+            edited_df = st.data_editor(
+                df_materials[
+                    [
+                        "id",
+                        "code",
+                        "name",
+                        "unit",
+                        "bag_weight",
+                        "opening_balance",
+                        "notes",
+                    ]
+                ],
+                column_config={
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                    "code": st.column_config.TextColumn("الكود"),
+                    "name": st.column_config.TextColumn("اسم الخامة"),
+                    "unit": st.column_config.TextColumn("الوحدة"),
+                    "bag_weight": st.column_config.NumberColumn(
+                        "وزن الشكارة (كجم)"
+                    ),
+                    "opening_balance": st.column_config.NumberColumn(
+                        "الرصيد الافتتاحي"
+                    ),
+                    "notes": st.column_config.TextColumn("ملاحظات"),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            if st.button(
+                "💾 حفظ التغييرات", type="primary", use_container_width=True
+            ):
+                for index, row in edited_df.iterrows():
+                    orig_row = df_materials.iloc[index]
+                    for col in [
+                        "code",
+                        "name",
+                        "unit",
+                        "bag_weight",
+                        "opening_balance",
+                        "notes",
+                    ]:
+                        if row[col] != orig_row[col]:
+                            update_material(int(row["id"]), col, row[col])
+                st.success("✅ تم حفظ التغييرات بنجاح!")
+                st.rerun()
+        else:
+            st.info(
+                "📭 لا توجد خامات مسجلة. انتقل إلى صفحة 'إضافة خامة جديدة' للبدء."
+            )
+    except Exception as e:
+        st.error(f"خطأ: {str(e)}")
+
+# ------------------------------------------------------------------------------
+# PAGE 2: حركة الخام
+# ------------------------------------------------------------------------------
+elif st.session_state.current_page == "movements":
+    st.markdown(
+        '<div class="section-header">🔄 حركة الخام - سجل الحركات اليومية</div>',
+        unsafe_allow_html=True,
+    )
+
+    with st.form("movement_form", clear_on_submit=True):
+        st.markdown('<div class="form-container">', unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            movement_date = st.date_input("التاريخ", date.today())
+        with c2:
+            movement_type = st.selectbox(
+                "نوع الحركة", ["IN (وارد)", "OUT (منصرف)"]
+            )
+        with c3:
+            materials_list = materials_df()
+            if not materials_list.empty:
+                material_options = {
+                    f"{row['code']} - {row['name']}": row["id"]
+                    for _, row in materials_list.iterrows()
+                }
+                selected_material = st.selectbox(
+                    "اختر الخامة (بالكود)", list(material_options.keys())
+                )
+            else:
+                st.warning("⚠️ يجب إضافة خامات أولاً")
+                selected_material = None
+
+        c4, c5 = st.columns(2)
+        with c4:
+            qty = st.number_input(
+                "الكمية", min_value=0.01, value=0.0, step=0.01
+            )
+        with c5:
+            reference = st.text_input(
+                "رقم مرجعي (فاتورة/أمر)", placeholder="مثال: PO-123"
+            )
+
+        c6, c7 = st.columns(2)
+        with c6:
+            party = st.text_input(
+                "الجهة / السبب", placeholder="مثال: مورد / خط إنتاج 1"
+            )
+        with c7:
+            notes = st.text_input("ملاحظات")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        submitted = st.form_submit_button(
+            "✅ تسجيل الحركة", type="primary", use_container_width=True
+        )
+
+        if submitted:
+            if selected_material is None:
+                st.error("❌ يجب اختيار خامة")
+            elif qty <= 0:
+                st.error("❌ الكمية يجب أن تكون أكبر من صفر")
+            else:
+                success, message = add_movement(
+                    date=movement_date,
+                    material_id=material_options[selected_material],
+                    movement_type=movement_type.split(" ")[0],
+                    qty=qty,
+                    reference=reference,
+                    party=party,
+                    notes=notes,
+                )
+                if success:
+                    st.success(f"✅ {message}")
+                    conn = connect()
+                    current_balance = get_current_balance(
+                        conn, material_options[selected_material]
+                    )
+                    conn.close()
+                    st.info(
+                        f"📊 الرصيد الحالي للخامة: **{current_balance:,.2f} كجم**"
+                    )
+                else:
+                    st.error(f"❌ {message}")
+
+    st.markdown("---")
+    st.markdown("### 📋 سجل الحركات المسجلة")
+    df_movements = movements_df()
+    if not df_movements.empty:
+        conn = connect()
+        df_movements["current_balance"] = df_movements["material_id"].apply(
+            lambda m_id: get_current_balance(conn, m_id)
+        )
         conn.close()
 
+        display_movements = df_movements[
+            [
+                "date",
+                "code",
+                "name",
+                "unit",
+                "movement_type",
+                "qty",
+                "current_balance",
+                "reference",
+                "party",
+            ]
+        ].copy()
+        display_movements.columns = [
+            "التاريخ",
+            "الكود",
+            "اسم الخامة",
+            "الوحدة",
+            "النوع",
+            "الكمية",
+            "الرصيد الحالي",
+            "المرجع",
+            "الجهة",
+        ]
+        display_movements["النوع"] = display_movements["النوع"].apply(
+            lambda x: "📥 وارد" if x == "IN" else "📤 منصرف"
+        )
+        st.dataframe(
+            display_movements, use_container_width=True, hide_index=True
+        )
 
-# ---------------------------------------------------------------- تصدير / نسخ احتياطي
-def export_excel(sheets):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        for name, df in sheets.items():
-            df.to_excel(w, index=False, sheet_name=str(name)[:31])
-    return buf.getvalue()
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            display_movements.to_excel(
+                writer, index=False, sheet_name="حركة الخام"
+            )
+        st.download_button(
+            label="📥 تصدير الحركات إلى Excel",
+            data=buf.getvalue(),
+            file_name=f"rofa_movements_{date.today().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    else:
+        st.info("📭 لا توجد حركات مسجلة حتى الآن.")
 
+# ------------------------------------------------------------------------------
+# PAGE 3: إضافة خامة جديدة
+# ------------------------------------------------------------------------------
+elif st.session_state.current_page == "add_material":
+    st.markdown(
+        '<div class="section-header">➕ إضافة خامة جديدة للمخزن</div>',
+        unsafe_allow_html=True,
+    )
+    with st.form("add_material_form", clear_on_submit=True):
+        st.markdown('<div class="form-container">', unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            code = st.text_input(
+                "كود الخامة *", placeholder="مثال: 1801 أو 218W"
+            )
+        with c2:
+            name = st.text_input("اسم الخامة *", placeholder="مثال: لينير ناشف")
+        with c3:
+            unit = st.selectbox("الوحدة", ["كجم", "طن", "لتر", "قطعة"])
 
-def backup_bytes():
-    src = connect()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-    tmp.close()
+        c4, c5 = st.columns(2)
+        with c4:
+            bag_weight = st.number_input(
+                "وزن الشكارة القياسي (كجم)", min_value=0.1, value=25.0, step=0.5
+            )
+        with c5:
+            opening_balance = st.number_input(
+                "الرصيد الافتتاحي (كجم)", min_value=0.0, value=0.0, step=0.01
+            )
+
+        notes = st.text_area(
+            "ملاحظات", placeholder="أي معلومات إضافية عن الخامة..."
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        submitted = st.form_submit_button(
+            "✅ إضافة الخامة", type="primary", use_container_width=True
+        )
+        if submitted:
+            if not code or not name:
+                st.error("❌ يجب ملء حقلي الكود والاسم")
+            else:
+                success, message = add_material(
+                    code=code,
+                    name=name,
+                    unit=unit,
+                    bag_weight=bag_weight,
+                    opening_balance=opening_balance,
+                    notes=notes,
+                )
+                if success:
+                    st.success(f"✅ {message}")
+                else:
+                    st.error(f"❌ {message}")
+
+# ------------------------------------------------------------------------------
+# PAGE 4: التقارير
+# ------------------------------------------------------------------------------
+elif st.session_state.current_page == "reports":
+    st.markdown(
+        '<div class="section-header">📊 التقارير والإحصائيات</div>',
+        unsafe_allow_html=True,
+    )
     try:
-        dst = sqlite3.connect(tmp.name)
-        src.backup(dst)
-        dst.close()
-        with open(tmp.name, "rb") as f:
-            return f.read()
-    finally:
-        src.close()
-        os.unlink(tmp.name)
+        df_materials = materials_df(active_only=False)
+        df_totals = get_material_totals()
 
+        if not df_materials.empty:
+            if not df_totals.empty:
+                df_materials = df_materials.merge(
+                    df_totals, left_on="id", right_on="material_id", how="left"
+                )
+                df_materials["total_in"] = df_materials["total_in"].fillna(0)
+                df_materials["total_out"] = df_materials["total_out"].fillna(0)
+            else:
+                df_materials["total_in"] = 0
+                df_materials["total_out"] = 0
 
-def restore_db(data):
-    if not data.startswith(b"SQLite format 3"):
-        raise AppError("err_restore")
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-    tmp.write(data)
-    tmp.close()
-    try:
-        chk = sqlite3.connect(tmp.name)
-        names = {r[0] for r in chk.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        chk.close()
-        if not {"items", "documents", "ledger"} <= names:
-            raise AppError("err_restore")
-        with open(tmp.name, "rb") as f:
-            payload = f.read()
-        with open(DB_FILE, "wb") as f:
-            f.write(payload)
-    finally:
-        os.unlink(tmp.name)
-    init_db()
+            df_materials["remaining"] = (
+                df_materials["opening_balance"]
+                + df_materials["total_in"]
+                - df_materials["total_out"]
+            )
+            df_materials["bags_count"] = (
+                df_materials["remaining"] / df_materials["bag_weight"]
+            ).round(2)
 
+            report_df = df_materials[
+                [
+                    "code",
+                    "name",
+                    "unit",
+                    "opening_balance",
+                    "total_in",
+                    "total_out",
+                    "remaining",
+                    "bags_count",
+                ]
+            ].copy()
+            report_df.columns = [
+                "الكود",
+                "اسم الخامة",
+                "الوحدة",
+                "الافتتاحي",
+                "الوارد",
+                "المنصرف",
+                "المتبقي (كجم)",
+                "عدد الشكاير",
+            ]
 
-# ---------------------------------------------------------------- بيانات تجريبية
-def load_demo():
-    conn = connect()
-    try:
-        if conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] > 0:
-            raise AppError("err_demo_nonempty")
-        for c in ["مواد خام", "منتجات تامة", "مستلزمات تعبئة"]:
-            conn.execute("INSERT INTO categories(name) VALUES (?)", (c,))
-        conn.execute("INSERT OR IGNORE INTO warehouses(code, name, location) VALUES ('BR1', 'مخزن الفرع', 'الفرع الثاني')")
-        for p in [("شركة النور للتوريدات", "SUPPLIER", "01000000001"), ("مصنع الأمل", "SUPPLIER", "01000000002"),
-                  ("عميل - الشروق", "CUSTOMER", "01000000003"), ("عميل - الندى", "CUSTOMER", "01000000004")]:
-            conn.execute("INSERT INTO partners(name, type, phone) VALUES (?,?,?)", p)
-        demo = [("RM-001", "دقيق فاخر", "مواد خام", "كجم", 200, 18, 0), ("RM-002", "سكر", "مواد خام", "كجم", 150, 24, 0),
-                ("RM-003", "زيت عباد الشمس", "مواد خام", "لتر", 100, 55, 0),
-                ("FG-001", "بسكويت سادة", "منتجات تامة", "علبة", 80, 12, 20),
-                ("FG-002", "كعك بالتمر", "منتجات تامة", "علبة", 60, 15, 25),
-                ("PK-001", "كرتونة 12 قطعة", "مستلزمات تعبئة", "قطعة", 300, 4, 0),
-                ("PK-002", "شريط لاصق", "مستلزمات تعبئة", "رول", 40, 18, 0),
-                ("PK-003", "أكياس تغليف", "مستلزمات تعبئة", "كيلو", 50, 70, 0)]
-        for r in demo:
-            conn.execute("INSERT INTO items(code, name, category, unit, min_stock, cost, price) VALUES (?,?,?,?,?,?,?)", r)
-        conn.commit()
-    finally:
-        conn.close()
+            st.dataframe(report_df, use_container_width=True, hide_index=True)
 
-    ids = {r.code: r.id for r in items_df().itertuples()}
-    whs = warehouses_df()
-    main, br = int(whs.id.iloc[0]), int(whs.id.iloc[-1])
-    parts = partners_df()
-    sup = int(parts[parts.type == "SUPPLIER"].id.iloc[0])
-    cus = int(parts[parts.type == "CUSTOMER"].id.iloc[0])
-    today = date.today()
-    d = lambda n: (today - timedelta(days=n)).isoformat()
-    L = lambda code, qty, uc=0: {"item_id": ids[code], "qty": qty, "unit_cost": uc}
-    create_document("IN", d(28), main, [L("RM-001", 800, 18), L("RM-002", 500, 24), L("RM-003", 300, 55),
-                                         L("PK-001", 900, 4), L("PK-002", 120, 18), L("PK-003", 90, 70)],
-                    partner_id=sup, reference="PO-1001")
-    create_document("IN", d(22), main, [L("FG-001", 250, 12), L("FG-002", 140, 15)], reference="WO-2001")
-    create_document("OUT", d(18), main, [L("RM-001", 620), L("RM-002", 380), L("RM-003", 215)], reference="WO-2001")
-    create_document("OUT", d(14), main, [L("FG-001", 120), L("FG-002", 70)], partner_id=cus, reference="INV-501")
-    create_document("TRANSFER", d(10), main, [L("FG-001", 60), L("FG-002", 25)], to_warehouse_id=br)
-    create_document("OUT", d(6), main, [L("PK-001", 820), L("PK-003", 48)], reference="WO-2002")
-    create_document("OUT", d(3), br, [L("FG-002", 20)], partner_id=cus, reference="INV-502")
-    create_document("RETURN_IN", d(1), main, [L("FG-001", 5)], partner_id=cus, reference="RET-9")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric(
+                    "إجمالي الافتتاحي", f"{report_df['الافتتاحي'].sum():,.2f} كجم"
+                )
+            with c2:
+                st.metric("إجمالي الوارد", f"{report_df['الوارد'].sum():,.2f} كجم")
+            with c3:
+                st.metric(
+                    "إجمالي المنصرف", f"{report_df['المنصرف'].sum():,.2f} كجم"
+                )
+            with c4:
+                st.metric(
+                    "إجمالي المتبقي",
+                    f"{report_df['المتبقي (كجم)'].sum():,.2f} كجم",
+                )
+
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                report_df.to_excel(
+                    writer, index=False, sheet_name="تقرير المخزن"
+                )
+            st.download_button(
+                label="📥 تصدير التقرير إلى Excel",
+                data=buf.getvalue(),
+                file_name=f"rofa_report_{date.today().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        else:
+            st.info("📭 لا توجد بيانات للتقرير")
+    except Exception as e:
+        st.error(f"خطأ: {str(e)}")
+
+st.markdown("---")
+st.markdown(
+    "<div style='text-align: center; color: #64748b; padding: 20px;'><strong>نظام ROFA لمخزن الخامات</strong></div>",
+    unsafe_allow_html=True,
+)
